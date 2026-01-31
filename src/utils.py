@@ -5,14 +5,20 @@ import yaml
 
 def load_config():
     """
-    Loads configuration from config.yaml.
-    Assumes config.yaml is in the project root.
+    Loads configuration from config.yaml by searching up from the current script.
     """
-    # Assuming utils.py is in src/
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = os.path.join(script_dir, "..", "config.yaml")
-    with open(config_path, "r") as f:
-        return yaml.safe_load(f)
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    while True:
+        config_path = os.path.join(current_dir, "config.yaml")
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                return yaml.safe_load(f)
+        
+        parent = os.path.dirname(current_dir)
+        if parent == current_dir: # Reached root
+            raise FileNotFoundError("config.yaml not found in directory tree.")
+        current_dir = parent
 
 
 class LLMUtility:

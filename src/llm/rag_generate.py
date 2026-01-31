@@ -10,13 +10,9 @@ from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTempla
 from langchain_core.output_parsers import StrOutputParser
 
 from src.llm.factory import get_llm
-from src.utils import LLMUtility
+from src.utils import LLMUtility, load_config
 
-def load_config():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = os.path.join(script_dir, "..", "..", "config.yaml")
-    with open(config_path, "r") as f:
-        return yaml.safe_load(f)
+
 
 def get_rag_chain():
     """

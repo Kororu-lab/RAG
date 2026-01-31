@@ -6,6 +6,14 @@ from PIL import Image
 from tqdm import tqdm
 from typing import List, Dict
 from colpali_engine.models import ColPali, ColPaliProcessor
+import sys
+
+# Ensure project root is in path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
+from src.utils import load_config
 
 VISION_DIR = os.path.join(os.path.dirname(__file__), "../../../data/ltdb_vision")
 METADATA_FILE = os.path.join(VISION_DIR, "metadata.jsonl") 
@@ -29,11 +37,7 @@ def load_metadata(path: str) -> List[Dict]:
 
     return data
     
-def load_config():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = os.path.join(script_dir, "..", "..", "config.yaml")
-    with open(config_path, "r") as f:
-        return yaml.safe_load(f)
+
 
 def main():
     config = load_config()

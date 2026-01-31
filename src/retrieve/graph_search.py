@@ -12,6 +12,7 @@ from langchain_core.output_parsers import StrOutputParser
 
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+from src.utils import load_config
 
 # Configure logging
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -20,11 +21,7 @@ logger = logging.getLogger(__name__)
 # Global Cache for Entity Names
 VALID_LANGUAGES = []
 
-def load_config():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = os.path.join(script_dir, "..", "..", "config.yaml")
-    with open(config_path, "r") as f:
-        return yaml.safe_load(f)
+
 
 def connect_neo4j(config):
     neo4j_conf = config.get("neo4j", {})

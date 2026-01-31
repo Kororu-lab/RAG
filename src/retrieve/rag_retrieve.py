@@ -21,7 +21,7 @@ from langchain_core.output_parsers import StrOutputParser
 import difflib
 
 from src.llm.factory import get_llm
-from src.utils import LLMUtility
+from src.utils import LLMUtility, load_config
 
 try:
     from src.retrieve.colpali_search import ColPaliRetriever
@@ -29,11 +29,7 @@ except ImportError as e:
     print(f"Error importing ColPaliRetriever: {e}")
     ColPaliRetriever = None
 
-def load_config():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = os.path.join(script_dir, "..", "..", "config.yaml")
-    with open(config_path, "r") as f:
-        return yaml.safe_load(f)
+
 
 def extract_query_metadata(query: str, config: Dict[str, Any]) -> Dict[str, Any]:
     """

@@ -6,13 +6,12 @@ import logging
 from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from src.utils import load_config
 
 # Configure Logging
 logging.basicConfig(level=logging.WARNING)
 
-def load_config():
-    with open("config.yaml", "r") as f:
-        return yaml.safe_load(f)
+
 
 def get_router_llm(config):
     """Initializes a lightweight LLM instance for routing."""
