@@ -81,7 +81,7 @@ def main():
     all_embeddings = []
     final_metadata = []
     
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 
     for i in tqdm(range(0, len(metadata), CHUNK_SIZE)):
         chunk_meta = metadata[i : i + CHUNK_SIZE]

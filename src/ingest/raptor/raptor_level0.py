@@ -261,7 +261,10 @@ def main():
     print(f"Found {len(all_files)} HTML files to process.")
     
     # Setup Output
-    output_file = "matrix_raptor_L0_data.jsonl"
+    # Setup Output
+    output_file = os.path.join("data", "raptor", "matrix_raptor_L0_data.jsonl")
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    
     if os.path.exists(output_file):
         os.remove(output_file)
         print(f"Initialized output file: {output_file}")

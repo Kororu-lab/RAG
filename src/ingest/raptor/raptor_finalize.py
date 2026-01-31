@@ -114,8 +114,8 @@ def main():
         
     # 3. Load Data
     print("Loading Data...")
-    l0_data = load_data("matrix_raptor_L0_data.jsonl")
-    l1_data = load_data("matrix_raptor_L1_data.jsonl")
+    l0_data = load_data(os.path.join("data", "raptor", "matrix_raptor_L0_data.jsonl"))
+    l1_data = load_data(os.path.join("data", "raptor", "matrix_raptor_L1_data.jsonl"))
     
     all_data = l0_data + l1_data
     print(f"Total entries to process: {len(all_data)} (L0: {len(l0_data)}, L1: {len(l1_data)})")

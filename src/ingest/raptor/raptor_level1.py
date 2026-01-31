@@ -337,12 +337,9 @@ def main():
     # Initialize LLM via Factory
     print(f"Initializing LLM (Ingestion Profile)...")
     llm = get_llm("ingestion")
-    # Note: parameters like repetition_penalty are now handled inside the factory or config if supported.
-    # ChatOpenAI doesn't support repeat_penalty natively in the same way, but Ollama does.
-    # Factory defaulting to Ollama preserves kwargs if passed, but for abstraction we rely on config settings.
-    
+
     # Load L0 Data
-    l0_file = "matrix_raptor_L0_data.jsonl"
+    l0_file = os.path.join("data", "raptor", "matrix_raptor_L0_data.jsonl")
     print(f"Loading {l0_file}...")
     l0_data = load_l0_data(l0_file)
     print(f"Loaded {len(l0_data)} chunks.")
@@ -374,7 +371,8 @@ def main():
             l1_results.append(res)
             
     # Save Output
-    output_file = "matrix_raptor_L1_data.jsonl"
+    output_file = os.path.join("data", "raptor", "matrix_raptor_L1_data.jsonl")
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
     print(f"\nSaving {len(l1_results)} Level 1 summaries to {output_file}...")
     with open(output_file, "w", encoding="utf-8") as f:
         for item in l1_results:

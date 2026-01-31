@@ -1,0 +1,69 @@
+project:
+  name: "ltdb_rag"
+  data_path: "./data/ltdb"
+  db_path: "./data/chroma_db"
+
+### LLM Configuration Examples ###
+# 1. OpenAI (GPT-4)
+#   provider: "openai"
+#   model_name: "gpt-4-turbo"
+#   api_key_env: "OPENAI_API_KEY"
+#
+# 2. Anthropic (Claude 3)
+#   provider: "anthropic"
+#   model_name: "claude-3-opus-20240229"
+#   api_key_env: "ANTHROPIC_API_KEY"
+#
+# 3. DeepSeek (via OpenAI Compatible API)
+#   provider: "deepseek"
+#   model_name: "deepseek-chat"
+#   base_url: "https://api.deepseek.com"
+#   api_key_env: "DEEPSEEK_API_KEY"
+
+llm_ingestion:
+  provider: "ollama"
+  model_name: "gpt-oss:120b"
+  base_url: "http://localhost:11434"
+  temperature: 0.1
+  num_ctx: 8192
+  api_key_env: "" # Environment variable for API Key (e.g. OPENAI_API_KEY). Leave blank for Ollama.
+
+llm_retrieval:
+  provider: "ollama"
+  model_name: "gpt-oss:20b"
+  base_url: "http://localhost:11434"
+  temperature: 0.1
+  num_ctx: 8192
+  api_key_env: "" # Environment variable for API Key (e.g. OPENAI_API_KEY). Leave blank for Ollama.
+
+embedding:
+  model_name: "BAAI/bge-m3"
+  device: "cuda" # or "cpu" if cuda is not available
+  normalize_embeddings: true
+
+retrieval:
+  search_type: "similarity" # or "mmr"
+  k: 30 # Initial retrieval count
+
+reranker:
+  enabled: true
+  model_name: "BAAI/bge-reranker-v2-m3"
+  top_n: 5
+
+rag:
+  enable_graph: false
+
+neo4j:
+  uri: "bolt://localhost:7687"
+  username: "neo4j"
+  password: "password" # Change this to your Neo4j password
+
+
+database:
+  type: "postgres"
+  host: "localhost"
+  port: 5432
+  user: "user"
+  password: "password" # Change this to your Postgres password
+  dbname: "ltdb_rag"
+  table_name: "linguistics_raptor"
