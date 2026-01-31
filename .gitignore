@@ -6,3 +6,6 @@ data/
 # Config files
 config.yaml
 
+# Python cache
+__pycache__/
+*.pyc
