@@ -225,8 +225,9 @@ def main():
     print(f"Loaded {len(valid_set)} valid languages for strict enforcement.")
     
     # Initialize LLM
-    llm_name = config["llm"]["model_name"]
-    base_url = config["llm"]["base_url"]
+    llm_cfg = config.get("llm_ingestion", config.get("llm", {}))
+    llm_name = llm_cfg.get("model_name")
+    base_url = llm_cfg.get("base_url")
     print(f"Initializing LLM: {llm_name}...")
     llm = ChatOllama(model=llm_name, base_url=base_url, temperature=0)
 

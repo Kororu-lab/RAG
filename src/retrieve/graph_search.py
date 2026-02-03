@@ -145,8 +145,9 @@ def main():
 
     config = load_config()
     
-    llm_name = config["llm"]["model_name"]
-    base_url = config["llm"]["base_url"]
+    llm_cfg = config.get("llm_retrieval", config.get("llm", {}))
+    llm_name = llm_cfg.get("model_name")
+    base_url = llm_cfg.get("base_url")
     
     driver = connect_neo4j(config)
     if not driver:

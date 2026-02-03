@@ -15,9 +15,10 @@ logging.basicConfig(level=logging.WARNING)
 
 def get_router_llm(config):
     """Initializes a lightweight LLM instance for routing."""
+    llm_cfg = config.get("llm_retrieval", config.get("llm", {}))
     return ChatOllama(
-        model=config["llm"]["model_name"],
-        base_url=config["llm"]["base_url"],
+        model=llm_cfg.get("model_name"),
+        base_url=llm_cfg.get("base_url"),
         temperature=0
     )
 

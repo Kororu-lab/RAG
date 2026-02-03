@@ -19,8 +19,9 @@ from src.llm.factory import get_llm
 CONFIG = load_config()
 DATA_PATH = CONFIG["project"]["data_path"]
 DB_PATH = CONFIG["project"]["db_path"]
-LLM_MODEL = CONFIG["llm"]["model_name"]
-BASE_URL = CONFIG["llm"]["base_url"]
+llm_cfg = CONFIG.get("llm_ingestion", CONFIG.get("llm", {}))
+LLM_MODEL = llm_cfg.get("model_name")
+BASE_URL = llm_cfg.get("base_url")
 
 from bs4 import BeautifulSoup, NavigableString
 
@@ -56,7 +57,6 @@ def parse_html_sections(file_path):
                 current_header = element.get_text(strip=True)
             
             # 'element' is the h1 tag -> switch context.
-            # 'element' is the NavigableString inside h1 -> don't add it to 'current_content' (which represents body).
             elif isinstance(element, NavigableString):
                 parent_name = element.parent.name
                 if parent_name not in ["h1", "h2", "h3", "script", "style"]:
