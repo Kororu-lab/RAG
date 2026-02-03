@@ -1,7 +1,8 @@
 # Data files
 *.jsonl
 *.json
-data/
+data/*
+!data/README.md
 
 # Config files
 config.yaml
