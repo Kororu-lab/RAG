@@ -67,8 +67,7 @@ def generate_answer(query: str, context: str) -> str:
     """
     chain = get_rag_chain()
     
-    # For agent use, we typically want the full string, not stream
-    # But we can simulate streaming if needed, or just invoke.
+    # Can simulate streaming if needed, or just invoke.
     response = chain.invoke({"context": context, "question": query})
     return response
 

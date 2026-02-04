@@ -3,6 +3,8 @@
 *.json
 data/*
 !data/README.md
+corrupt_samples/*
+!corrupt_samples/README.md
 
 # Config files
 config.yaml

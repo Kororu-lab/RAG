@@ -32,7 +32,7 @@ def get_llm(profile: str = "retrieval"):
 
     provider = cfg.get("provider", "ollama").lower()
     model_name = cfg.get("model_name")
-    temperature = cfg.get("temperature", 0.1)
+    temperature = cfg.get("temperature", 0.1) # 0.1, 필요 부분에서 0으로 override
     base_url = cfg.get("base_url")
     
     # 1. Ollama

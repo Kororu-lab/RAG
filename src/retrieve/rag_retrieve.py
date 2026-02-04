@@ -450,10 +450,17 @@ class RAGRetriever:
                 # Fallback for L0: file_basename:chunk_id (Header)
                 src_file = doc.metadata.get('source_file', 'Unknown')
                 src_base = os.path.basename(src_file)
+                lang = doc.metadata.get('lang')
+                
+                if lang and lang.lower() not in ['unknown', 'none']:
+                    display_name = f"{lang}/{src_base}"
+                else:
+                    display_name = src_base
+                    
                 chunk_id = doc.metadata.get('chunk_id', '?')
                 header = doc.metadata.get('original_header', '')
                 
-                ref_id = f"{src_base}:{chunk_id}"
+                ref_id = f"{display_name}:{chunk_id}"
                 if header:
                     ref_id += f" [{header}]"
              

@@ -22,7 +22,7 @@ def retrieve_node(state: GraphState):
         pass
 
     # Dynamic Top-K & Top-N Strategy (Linked Dynamic Scaling)
-    # Heuristic: Broad queries need more context (Higher K, Higher Top-N)
+    # Broad queries need more context (Higher K, Higher Top-N)
     base_k = 5
     base_top_n = 5
     
@@ -77,10 +77,6 @@ def grade_documents_node(state: GraphState):
     relevance_count = 0
     
     for d in documents:
-        # Optimization: Skip grading if already graded? (Not implemented)
-        
-        # Vision docs are usually high quality if recalled by ColPali, but we can grade them too.
-        # ENRICHMENT: Inject Source Metadata for Context
         source_info = f"[Source]: {d.metadata.get('source_file', 'unknown')}"
         rich_content = f"{source_info}\n{d.page_content}"
         
@@ -144,7 +140,6 @@ def check_hallucination_node(state: GraphState):
     checker = get_hallucination_chain()
     
     # Prepare documents text for checker
-    # Tuning: Provide full context up to a safety limit (e.g., 30,000 chars) to prevent False Positives
     full_text = "\n".join([d.page_content for d in documents])
     
     if len(full_text) > 30000:
@@ -154,7 +149,6 @@ def check_hallucination_node(state: GraphState):
         
     # --- Refusal Pre-Check ---
     # Detect if the model correctly refused to answer due to lack of info.
-    # This prevents "False Positive" Hallucination triggered by strict grading of "I don't know".
     refusal_keywords = ["정보가 부족", "알 수 없습니다", "문맥에 나타나 있지 않으", "제공된 문맥", "information is missing"]
     if any(k in generation for k in refusal_keywords):
         print("  - DECISION: GROUNDED REFUSAL (Pass)")
