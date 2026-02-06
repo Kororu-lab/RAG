@@ -29,6 +29,13 @@ except ImportError as e:
     print(f"Error importing ColPaliRetriever: {e}")
     ColPaliRetriever = None
 
+try:
+    from src.retrieve.bm25_search import BM25Index, reciprocal_rank_fusion
+    BM25_AVAILABLE = True
+except ImportError as e:
+    print(f"BM25 not available: {e}")
+    BM25_AVAILABLE = False
+
 
 
 def extract_query_metadata(query: str, config: Dict[str, Any]) -> Dict[str, Any]:
@@ -170,6 +177,17 @@ class RAGRetriever:
         )
         self.table_name = self.db_cfg.get('table_name', 'linguistics_raptor')
         
+        # Hybrid search config
+        hybrid_cfg = self.config.get("retrieval", {}).get("hybrid_search", {})
+        self.hybrid_enabled = hybrid_cfg.get("enabled", False) and BM25_AVAILABLE
+        self.vector_weight = hybrid_cfg.get("vector_weight", 0.6)
+        self.bm25_weight = hybrid_cfg.get("bm25_weight", 0.4)
+        self.rrf_k = hybrid_cfg.get("rrf_k", 60)
+        self.bm25_index_path = hybrid_cfg.get("index_path", "data/bm25_index.pkl")
+        
+        if self.hybrid_enabled:
+            print(f"Hybrid Search: enabled (vector={self.vector_weight}, bm25={self.bm25_weight})")
+        
         self.vision_keywords = ["도표", "table", "chart", "structure", "구조", "IPA", "paradigm", "gloss", "마커", "marker", "예시", "box", "박스"]
 
     def _clean_memory(self):
@@ -198,41 +216,101 @@ class RAGRetriever:
         self._clean_memory()
         print("Embeddings unloaded.")
 
-        threshold_dist = 0.55 
+        threshold_dist = 0.55
+        fetch_k = k * 3
         
-        # Dynamic SQL Construction for Filtering
-        where_conditions = ["(embedding <=> %s::vector) < %s"]
-        params = [query_vector, query_vector, threshold_dist]
-        
+        # Build language filter clause
+        lang_filter = ""
+        lang_param = []
         if metadata and metadata.get('lang'):
             lang = metadata['lang']
             print(f"Applying Language Filter: {lang}")
-            where_conditions.append("metadata->>'lang' = %s")
-            params.append(lang)
-            
-        where_clause = " AND ".join(where_conditions)
+            lang_filter = " AND metadata->>'lang' = %s"
+            lang_param = [lang]
         
-        sql = f"""
-            SELECT content, metadata, (embedding <=> %s::vector) as distance
+        # 1. Vector Search
+        vector_sql = f"""
+            SELECT id, content, metadata, (embedding <=> %s::vector) as distance
             FROM {self.table_name}
-            WHERE {where_clause}
+            WHERE (embedding <=> %s::vector) < %s {lang_filter}
             ORDER BY distance ASC LIMIT %s
         """
-        params.append(k * 3) # Fetch more triggers
+        vector_params = [query_vector, query_vector, threshold_dist] + lang_param + [fetch_k]
         
-        text_docs = []
+        vector_results = []  # [(id, distance)]
+        doc_cache = {}       # id -> (content, metadata)
+        
         with self.conn.cursor() as cur:
-            cur.execute(sql, tuple(params))
-            rows = cur.fetchall()
-            for row in rows:
-                content, meta, dist = row
-                # Use original_content if available (for L0), fallback to summary
+            cur.execute(vector_sql, tuple(vector_params))
+            for row in cur.fetchall():
+                doc_id, content, meta, dist = row
+                vector_results.append((doc_id, 1 - dist))  # Convert to similarity
+                doc_cache[doc_id] = (content, meta)
+        
+        print(f"Vector Search: {len(vector_results)} matches")
+        
+        # 2. BM25 Search (if enabled)
+        bm25_results = []
+        if self.hybrid_enabled:
+            try:
+                bm25_index = BM25Index(self.bm25_index_path)
+                bm25_results = bm25_index.search(query, top_k=fetch_k)
+                print(f"BM25 Search: {len(bm25_results)} matches")
+            except Exception as e:
+                print(f"BM25 search failed: {e}")
+        
+        # 3. Merge results
+        if self.hybrid_enabled and bm25_results:
+            # RRF Fusion
+            rrf_scores = reciprocal_rank_fusion(
+                vector_results, bm25_results,
+                k=self.rrf_k,
+                vector_weight=self.vector_weight,
+                bm25_weight=self.bm25_weight
+            )
+            
+            # Sort by RRF score
+            sorted_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
+            
+            # Fetch any docs from BM25 not in cache
+            missing_ids = [doc_id for doc_id in sorted_ids if doc_id not in doc_cache]
+            if missing_ids:
+                placeholders = ','.join(['%s'] * len(missing_ids))
+                with self.conn.cursor() as cur:
+                    cur.execute(f"""
+                        SELECT id, content, metadata FROM {self.table_name}
+                        WHERE id IN ({placeholders})
+                    """, tuple(missing_ids))
+                    for row in cur.fetchall():
+                        doc_id, content, meta = row
+                        doc_cache[doc_id] = (content, meta)
+            
+            # Build final doc list
+            text_docs = []
+            for doc_id in sorted_ids[:fetch_k]:
+                if doc_id not in doc_cache:
+                    continue
+                content, meta = doc_cache[doc_id]
                 actual_content = meta.get('original_content', content)
                 doc = Document(page_content=actual_content, metadata=meta)
-                doc.metadata['score'] = 1 - dist
+                doc.metadata['score'] = rrf_scores[doc_id]
+                doc.metadata['_db_id'] = doc_id
                 text_docs.append(doc)
+            
+            print(f"Hybrid Search (RRF): {len(text_docs)} merged results")
+        else:
+            # Vector-only fallback
+            text_docs = []
+            for doc_id, score in vector_results:
+                content, meta = doc_cache[doc_id]
+                actual_content = meta.get('original_content', content)
+                doc = Document(page_content=actual_content, metadata=meta)
+                doc.metadata['score'] = score
+                doc.metadata['_db_id'] = doc_id
+                text_docs.append(doc)
+            
+            print(f"Vector Search: {len(text_docs)} results (hybrid disabled)")
         
-        print(f"Raw Vector Matches (Threshold > {1-threshold_dist:.2f}): {len(text_docs)}")
         return self._recursive_expand(text_docs)
 
     def _recursive_expand(self, docs: List[Document]) -> List[Document]:

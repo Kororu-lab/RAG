@@ -179,8 +179,19 @@ def main():
             conn.commit()
             total_embedded += len(batch_texts)
             
-    conn.close()
     print(f"Ingestion Complete. {total_embedded} vectors stored in table '{db_table}'.")
+    
+    # Build BM25 Index
+    print("\nBuilding BM25 index for hybrid search...")
+    try:
+        from src.retrieve.bm25_search import BM25Index
+        index_path = config.get("retrieval", {}).get("hybrid_search", {}).get("index_path", "data/bm25_index.pkl")
+        bm25 = BM25Index(index_path)
+        bm25.build_from_db(conn, db_table)
+    except Exception as e:
+        print(f"Warning: BM25 index build failed: {e}")
+    
+    conn.close()
 
 if __name__ == "__main__":
     main()
