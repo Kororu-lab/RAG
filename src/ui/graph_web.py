@@ -1,18 +1,15 @@
+"""RAG Agent Web Interface - Streamlit UI for testing RAG system."""
 
 import streamlit as st
 import sys
 import os
-import contextlib
 import io
-import time
 
-# Ensure project root is in path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, "../.."))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-# Import the graph app
 from src.agent.graph import app
 
 st.set_page_config(
@@ -24,50 +21,55 @@ st.set_page_config(
 st.title("테스트용 RAG(Agent)")
 st.caption("src/agent/graph.py 기반")
 
-# session state initialization
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Sidebar for controls/info
+# Sidebar
 with st.sidebar:
     st.header("Settings")
     
     # Model Selection
     model_options = ["gpt-oss:20b", "gpt-oss:120b"]
-    selected_model = st.selectbox(
-        "Select LLM Model",
-        model_options,
-        index=0
-    )
-    
+    selected_model = st.selectbox("Select LLM Model", model_options, index=0)
     st.info(f"Current Model: **{selected_model}**")
     
-    # Config Patching Mechanism
+    st.divider()
+    
+    # Retrieval Settings
+    st.header("⚙️ Retrieval Settings")
+    bm25_enabled = st.checkbox("BM25 Hybrid Search", value=True)
+    reranker_enabled = st.checkbox("Reranker", value=True)
+    recursive_enabled = st.checkbox("Recursive Retrieval", value=True)
+    vision_enabled = st.checkbox("Vision Search", value=False)
+    
+    st.divider()
+    
+    # Config Patching
     import src.utils
     
-    # Store original function only once to prevent recursion on re-runs
     if not hasattr(src.utils, "_original_load_config"):
         src.utils._original_load_config = src.utils.load_config
 
     def patched_load_config():
         config = src.utils._original_load_config()
-        # Override Retreival Model
-        if "llm_retrieval" not in config:
-            config["llm_retrieval"] = {}
         
-        # Override logic
-        config["llm_retrieval"]["model_name"] = selected_model
-        
-        # Also Config fallback 
+        # Model override
+        config.setdefault("llm_retrieval", {})["model_name"] = selected_model
         if "llm" in config:
             config["llm"]["model_name"] = selected_model
-            
+        
+        # Retrieval settings override
+        retrieval = config.setdefault("retrieval", {})
+        retrieval.setdefault("hybrid_search", {})["enabled"] = bm25_enabled
+        retrieval["recursive_retrieval"] = recursive_enabled
+        retrieval["vision_search"] = vision_enabled
+        
+        # Reranker override
+        config.setdefault("reranker", {})["enabled"] = reranker_enabled
+        
         return config
 
-    # Apply Patch
     src.utils.load_config = patched_load_config
-    
-    st.divider()
     
     st.header("Status")
     st.success("System Ready")
@@ -80,69 +82,54 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# Custom Logger to redirect stdout to Streamlit
+
 class StreamlitLogger:
+    """Redirects stdout to Streamlit code block."""
+    
     def __init__(self, original_stdout, placeholder):
         self.original_stdout = original_stdout
         self.placeholder = placeholder
         self.log_buffer = io.StringIO()
 
     def write(self, message):
-        self.original_stdout.write(message) # Write to real terminal
-        self.log_buffer.write(message)      # Write to buffer
-        # Update Web UI
-        # Note: calling this too frequently might cause performance issues, 
-        # but for terminal logs it's usually acceptable.
+        self.original_stdout.write(message)
+        self.log_buffer.write(message)
         self.placeholder.code(self.log_buffer.getvalue(), language="text")
 
     def flush(self):
         self.original_stdout.flush()
 
+
 # Chat Input
 if prompt := st.chat_input("Enter your query"):
-    # Add user message
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Assistant Response Container
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
         
-        # Area for Raw Output (Collapsed by default, or open if preferred)
         with st.expander("Terminal Output (Real-time)", expanded=True):
             log_placeholder = st.empty()
-            log_text = "Initializing...\n"
-            log_placeholder.code(log_text, language="text")
+            log_placeholder.code("Initializing...\n", language="text")
 
-        # Capture output and Run Graph
         full_response = ""
         final_answer_found = False
-        
-        # Save original stdout
         original_stdout = sys.stdout
         logger = StreamlitLogger(original_stdout, log_placeholder)
 
         try:
             sys.stdout = logger
-            
-            # Run Graph
             inputs = {"question": prompt, "search_count": 0}
             
-            # Stream events
             for output in app.stream(inputs):
                 for key, value in output.items():
-                    # Log Node transition
-                    # print(f"Node '{key}' executed.") # Handled by graph.py prints usually
-                    
                     if key == "generate" and "generation" in value:
                         final_generation = value["generation"]
-                        # Just overwrite the placeholder with the final answer
                         message_placeholder.markdown(final_generation)
                         full_response = final_generation
                         final_answer_found = True
                         
-                        # Add References
                         if "documents" in value:
                             refs = "\n\n**Reference Sources:**\n"
                             seen_refs = set()
@@ -151,30 +138,23 @@ if prompt := st.chat_input("Enter your query"):
                                 if ref_id not in seen_refs:
                                     level = doc.metadata.get('level', '0')
                                     prefix = "Summary" if str(level) == '1' else "Detail"
-                                    # Create a link if possible (for local file, we can't easily, just text)
                                     refs += f"- `[{prefix}]` {ref_id}\n"
                                     seen_refs.add(ref_id)
                             
                             full_response += refs
                             message_placeholder.markdown(full_response)
-                            
-                    elif "question" in value and key == "rewrite":
-                         pass # Already logged to stdout by graph.py
 
         except Exception as e:
             st.error(f"An error occurred: {e}")
             import traceback
             traceback.print_exc()
         finally:
-            # Restore stdout
             sys.stdout = original_stdout
             
-        # Save history
         if final_answer_found:
-             st.session_state.messages.append({"role": "assistant", "content": full_response})
+            st.session_state.messages.append({"role": "assistant", "content": full_response})
         else:
-             # Fallback if no generation key (maybe filtered out)
-             if not full_response:
-                 full_response = "No response generated. Please check terminal output."
-                 message_placeholder.warning(full_response)
-             st.session_state.messages.append({"role": "assistant", "content": full_response})
+            if not full_response:
+                full_response = "No response generated. Please check terminal output."
+                message_placeholder.warning(full_response)
+            st.session_state.messages.append({"role": "assistant", "content": full_response})

@@ -44,6 +44,14 @@ embedding:
 retrieval:
   search_type: "similarity" # or "mmr"
   k: 30 # Initial retrieval count
+  recursive_retrieval: true  # Expand L1 summaries to L0 chunks
+  vision_search: false       # ColPali vision search for tables/images
+  hybrid_search:
+    enabled: true
+    vector_weight: 0.6
+    bm25_weight: 0.4
+    rrf_k: 60
+    index_path: "data/bm25_index.pkl"
 
 reranker:
   enabled: true

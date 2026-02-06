@@ -21,7 +21,8 @@ from langchain_core.output_parsers import StrOutputParser
 import difflib
 
 from src.llm.factory import get_llm
-from src.utils import LLMUtility, load_config
+import src.utils  # Module import for dynamic patching support
+from src.utils import LLMUtility
 
 try:
     from src.retrieve.colpali_search import ColPaliRetriever
@@ -156,7 +157,7 @@ Domain (Return ONLY the category name):"""
 
 class RAGRetriever:
     def __init__(self):
-        self.config = load_config()
+        self.config = src.utils.load_config()  # Use module-level for patching support
         self.db_cfg = self.config.get("database", {})
         
         self.embedding_model_name = self.config["embedding"]["model_name"]
@@ -188,6 +189,11 @@ class RAGRetriever:
         if self.hybrid_enabled:
             print(f"Hybrid Search: enabled (vector={self.vector_weight}, bm25={self.bm25_weight})")
         
+        # Vision and recursive retrieval config
+        retrieval_cfg = self.config.get("retrieval", {})
+        self.vision_enabled = retrieval_cfg.get("vision_search", True)
+        self.recursive_enabled = retrieval_cfg.get("recursive_retrieval", True)
+        
         self.vision_keywords = ["도표", "table", "chart", "structure", "구조", "IPA", "paradigm", "gloss", "마커", "marker", "예시", "box", "박스"]
 
     def _clean_memory(self):
@@ -198,7 +204,7 @@ class RAGRetriever:
             torch.cuda.empty_cache()
 
     def _is_visual_query(self, query: str) -> bool:
-        if not ColPaliRetriever:
+        if not ColPaliRetriever or not self.vision_enabled:
             return False
         return any(k in query.lower() for k in self.vision_keywords)
 
@@ -319,6 +325,9 @@ class RAGRetriever:
         If a retrieved doc is Level 1 (Summary), expand it to its child Level 0 (Raw) chunks.
         This ensures the LLM sees the original detailed text, not just the summary.
         """
+        if not self.recursive_enabled:
+            return docs
+            
         expanded_docs = []
         l1_found = False
         
