@@ -73,7 +73,7 @@ def main():
     config = load_config()
     db_table = config['database']['table_name']
     
-    # 0.1 Optimization: Force unload Ollama
+    # Unload Ollama to free VRAM
     print("Unloading any resident Ollama models to free VRAM...")
     try:
         # Support new config structure
@@ -94,7 +94,7 @@ def main():
     except Exception as e:
         print(f"Warning: Could not unload model: {e}")
 
-    # 1. Initialize Embeddings
+    # Initialize Embeddings
     device = config['embedding']['device']
     print(f"Initializing Embeddings (BAAI/bge-m3) on device: {device}...")
     embeddings = HuggingFaceEmbeddings(
@@ -103,7 +103,7 @@ def main():
         encode_kwargs={'normalize_embeddings': config['embedding']['normalize_embeddings']}
     )
     
-    # 2. Connect & Init DB
+    # Connect & Init DB
     try:
         conn = get_db_connection(config)
         init_db(conn, db_table, vector_dim=1024)
@@ -112,7 +112,7 @@ def main():
         print("Ensure PostgreSQL is running with pgvector extension.")
         sys.exit(1)
         
-    # 3. Load Data
+    # Load Data
     print("Loading Data...")
     l0_data = load_data(os.path.join("data", "raptor", "matrix_raptor_L0_data.jsonl"))
     l1_data = load_data(os.path.join("data", "raptor", "matrix_raptor_L1_data.jsonl"))
@@ -120,8 +120,8 @@ def main():
     all_data = l0_data + l1_data
     print(f"Total entries to process: {len(all_data)} (L0: {len(l0_data)}, L1: {len(l1_data)})")
     
-    # 4. Processing & Insertion
-    batch_size = 8  # Reduced from 64 to prevent OOM
+    # Processing & Insertion
+    batch_size = 8
     total_embedded = 0
     
     print("Starting Ingestion...")

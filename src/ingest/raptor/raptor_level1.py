@@ -151,7 +151,7 @@ The input contains data from multiple languages regarding this topic.
     attempts = 0
     max_attempts = 2
     
-    # 2. Batching Logic for Large Clusters
+    # Batching for large clusters
     if len(items) > 15:
         print(f"  [INFO] Large cluster detected ({len(items)} items). Switching to Batch Summarization.")
         return summarize_in_batches(llm, group_type, group_key, items, system_prompt, format_prompt)
@@ -201,9 +201,7 @@ The input contains data from multiple languages regarding this topic.
             elif "[Summary]:" in response:
                  summary_text = response.replace("[Summary]:", "").strip()
                  
-            # Construct Result Object
-            # Schema Update for Recursive Retrieval:
-            # Store precise references to L0 chunks: [{"source_file": "...", "chunk_id": 0}, ...]
+            # Store precise references for recursive retrieval
             child_refs = [
                 {"source_file": item.get("source_file"), "chunk_id": item.get("chunk_id")}
                 for item in items
@@ -236,7 +234,7 @@ def summarize_in_batches(llm, group_type, group_key, items, system_prompt, forma
     intermediate_summaries = []
     print(f"  > Batch Processing: Split {len(items)} items into {len(batches)} batches.")
     
-    # Step 1: Batch Summarization
+    # Batch summarization
     batch_prompt_template = """You are a linguistics expert.
 Synthesize the key points of these linguistic chunks into a concise intermediate summary.
 Focus on extracting factual patterns and features.
@@ -257,7 +255,7 @@ Summary:"""
         except Exception as e:
             print(f"      [Error] Batch {i+1} failed: {e}")
             
-    # Step 2: Final Synthesis
+    # Final Synthesis
     print(f"  > Synthesizing {len(intermediate_summaries)} intermediate summaries...")
     final_context = "\n\n".join(intermediate_summaries)
     
@@ -310,20 +308,20 @@ def _is_garbage_output(text: str) -> bool:
     if len(text) < 100:
         return False
         
-    # 1. Repetition Check (Unique Word Ratio)
+    # Repetition check
     words = text.split()
     if len(text) > 300 and len(words) > 0:
         unique_ratio = len(set(words)) / len(words)
         if unique_ratio < 0.1: # < 10% unique words
             return True
             
-    # 2. N-gram Repetition (Crucial for phrases like 'is a vowel. is a vowel.')
+    # N-gram repetition
     if len(text) > 200:
         tail = text[-100:]
         if text.count(tail) > 2: # Repeated 3+ times
             return True
             
-    # 3. Known Hallucination Keywords
+    # Known hallucination keywords
     bad_keywords = ["Artificial Intelligence", "Future of Work", "Machine Learning", "Job displacement", "일의 미래", "인공지능"]
     for kw in bad_keywords:
         if kw in text and "Linguistics" not in text: 
@@ -352,7 +350,7 @@ def main():
     # Process Groups
     l1_results = []
     
-    # 1. Vertical Processing
+    # Vertical Processing
     total_vertical = len(groups["vertical"])
     print(f"\nProcessing Vertical Groups (Languages)... Total: {total_vertical}")
     for i, (lang, items) in enumerate(groups["vertical"].items()):
@@ -361,7 +359,7 @@ def main():
         if res:
             l1_results.append(res)
             
-    # 2. Horizontal Processing
+    # Horizontal Processing
     total_horizontal = len(groups["horizontal"])
     print(f"\nProcessing Horizontal Groups (Topics)... Total: {total_horizontal}")
     for i, (topic, items) in enumerate(groups["horizontal"].items()):

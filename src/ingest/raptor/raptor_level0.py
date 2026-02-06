@@ -15,7 +15,6 @@ from src.ingest.xsampa_converter import xsampa_to_ipa
 from src.llm.factory import get_llm
 
 
-# --- 1. Configuration & Setup ---
 CONFIG = load_config()
 DATA_PATH = CONFIG["project"]["data_path"]
 DB_PATH = CONFIG["project"]["db_path"]
@@ -34,8 +33,7 @@ def parse_html_sections(file_path):
     with open(file_path, "r", encoding="utf-8") as f:
         soup = BeautifulSoup(f, "html.parser")
 
-    # HYBRID STRATEGY STEP 1: Pre-convert explicit X-SAMPA tags
-    # This preserves superscripts (e.g., Tone numbers) which might be masked otherwise.
+    # Pre-convert X-SAMPA tags to preserve tone superscripts
     for tag in soup.find_all(class_='xsampa'):
         if tag.string:
             converted = xsampa_to_ipa(tag.string)
@@ -74,8 +72,7 @@ def summarize_section(llm, text, header, language):
     """
     Generates a Level 0 summary using an LLM with Masking Strategy.
     """
-    # HYBRID STRATEGY STEP 2: Masking Protection
-    # Protect numbers from X-SAMPA conversion (1929 -> ⦗NUM:1929⦘)
+    # Mask numbers to protect from X-SAMPA conversion
     masked_text = re.sub(r'(\d+)', r'⦗NUM:\1⦘', text)
 
     prompt = ChatPromptTemplate.from_template("""
@@ -116,8 +113,7 @@ The input text contains **X-SAMPA** phonetic encoding.
         "text": masked_text
     })
 
-    # HYBRID STRATEGY STEP 3: Unmasking
-    # Restore numbers in the final output (⦗NUM:1929⦘ -> 1929)
+    # Unmask numbers in output
     unmasked_response = re.sub(r'⦗NUM:(\d+)⦘', r'\1', response)
     
     return unmasked_response
@@ -129,20 +125,20 @@ def _is_garbage_output(text: str) -> bool:
     if len(text) < 100:
         return False
         
-    # 1. Repetition Check (Unique Word Ratio)
+    # Repetition check
     words = text.split()
     if len(text) > 300 and len(words) > 0:
         unique_ratio = len(set(words)) / len(words)
         if unique_ratio < 0.1: # < 10% unique words
             return True
             
-    # 2. N-gram Repetition (Crucial for phrases like 'is a vowel. is a vowel.')
+    # N-gram repetition
     if len(text) > 200:
         tail = text[-100:]
         if text.count(tail) > 2: # Repeated 3+ times
             return True
             
-    # 3. Known Hallucination Keywords (Programming tutorials, AI safety, etc.)
+    # Known hallucination keywords
     bad_keywords = [
         "Artificial Intelligence", "Future of Work", "Machine Learning", 
         "Job displacement", "일의 미래", "인공지능",
@@ -197,12 +193,9 @@ def process_file(file_path, llm):
     file_data = []
 
     for i, (header, raw_content) in enumerate(sections):
-        # 1. Pre-processing: X-SAMPA conversion DISABLED due to data corruption risk.
-        # Clean known data artifacts
         content = raw_content.replace("ERROR: no translation line", "").strip()
         content_len = len(content)
 
-        # 2. Logic: Short Sentence Bypass
         if content_len < 10:
             continue  # Noise
         

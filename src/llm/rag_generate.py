@@ -20,7 +20,6 @@ def get_rag_chain():
     """
     llm = get_llm("retrieval")
 
-    # Clean System/User split for correct instruction adherence
     system_text = """당신은 언어학 데이터베이스(LTDB) 전문 연구원입니다.
 1. **문맥 기반 답변 (Truthfulness)**
    - 제공된 [Context]에 있는 내용만을 바탕으로 답변을 구성하십시오.
@@ -66,8 +65,6 @@ def generate_answer(query: str, context: str) -> str:
     Generates an answer string programmatically.
     """
     chain = get_rag_chain()
-    
-    # Can simulate streaming if needed, or just invoke.
     response = chain.invoke({"context": context, "question": query})
     return response
 
@@ -97,7 +94,7 @@ def generate():
     print(f"Model: {llm_model}")
     print("-" * 50)
     
-    # Stream output for CLI experience
+    # Stream output
     stream_active = False
     try:
         full_response = ""
@@ -122,7 +119,6 @@ def generate():
     print("\\n[Reference Sources]")
     for ref in references:
         if ref['type'] == 'text':
-            # RAPTOR Reference Format
             level = ref.get('level', '0')
             prefix = "[Summary/L1]" if str(level) == '1' else "[Detail/L0]"
             ref_id = ref.get('ref_id', 'Unknown')
@@ -139,7 +135,7 @@ def generate():
             
     print("=" * 50)
     
-    # Force unload LLM to free VRAM for next run
+    # Cleanup
     print("Stage 2 Complete. Unloading LLM...")
     LLMUtility.unload_model("retrieval")
 

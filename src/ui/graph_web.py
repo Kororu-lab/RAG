@@ -21,8 +21,8 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("🤖 Advanced RAG Agent")
-st.caption("Interactive Chat with Real-time Terminal Output")
+st.title("테스트용 RAG(Agent)")
+st.caption("src/agent/graph.py 기반")
 
 # session state initialization
 if "messages" not in st.session_state:
@@ -30,6 +30,45 @@ if "messages" not in st.session_state:
 
 # Sidebar for controls/info
 with st.sidebar:
+    st.header("Settings")
+    
+    # Model Selection
+    model_options = ["gpt-oss:20b", "gpt-oss:120b"]
+    selected_model = st.selectbox(
+        "Select LLM Model",
+        model_options,
+        index=0
+    )
+    
+    st.info(f"Current Model: **{selected_model}**")
+    
+    # Config Patching Mechanism
+    import src.utils
+    
+    # Store original function only once to prevent recursion on re-runs
+    if not hasattr(src.utils, "_original_load_config"):
+        src.utils._original_load_config = src.utils.load_config
+
+    def patched_load_config():
+        config = src.utils._original_load_config()
+        # Override Retreival Model
+        if "llm_retrieval" not in config:
+            config["llm_retrieval"] = {}
+        
+        # Override logic
+        config["llm_retrieval"]["model_name"] = selected_model
+        
+        # Also Config fallback 
+        if "llm" in config:
+            config["llm"]["model_name"] = selected_model
+            
+        return config
+
+    # Apply Patch
+    src.utils.load_config = patched_load_config
+    
+    st.divider()
+    
     st.header("Status")
     st.success("System Ready")
     if st.button("Clear History"):

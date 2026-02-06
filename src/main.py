@@ -49,7 +49,7 @@ Category:"""
     
     try:
         category = chain.invoke({"query": query}).strip().upper()
-        # Fallback if LLM output is messy
+        # Fallback parsing
         if "GRAPH" in category: return "GRAPH"
         return "VECTOR"
     except Exception as e:
@@ -107,7 +107,6 @@ def main():
             continue
 
         if not enable_graph:
-            # Bypass router if graph is disabled
             run_vector_pipeline(query)
             continue
 

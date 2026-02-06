@@ -41,10 +41,9 @@ def extract_query_metadata(query: str, config: Dict[str, Any]) -> Dict[str, Any]
     """
     metadata = {'lang': None, 'topic': None}
     
-    # 0. Global Optimization
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-    # --- Step 1: Language Detection ---
+    # Language Detection
     
     # Fast Path: Check against known directory names
     data_path = config["project"]["data_path"]
@@ -61,19 +60,15 @@ def extract_query_metadata(query: str, config: Dict[str, Any]) -> Dict[str, Any]
             metadata['lang'] = lang
             break
 
-    # LLM Path (only if Fast Path failed)
+    # LLM fallback
     llm = None
     if not metadata['lang']:
         print("Simple detection failed. Using LLM for language detection...")
-        # config["llm"] is deprecated. Use llm_retrieval for query analysis.
         llm_name = config.get("llm_retrieval", config.get("llm", {})).get("model_name")
         
         try:
             llm = get_llm("retrieval")
-            # Note: Factory handles instantiation, but prompts expect LLM object.
-            # We don't set keep_alive manually here as factory does it for Ollama.
             
-            # 1. Language Prompt
             lang_prompt = ChatPromptTemplate.from_template(
                 """Analyze the user's query and identify if a specific language is being asked about.
 If found, translate it to its standard English Academic name.
@@ -101,7 +96,7 @@ Language Name (English only, no punctuation):"""
                         print(f"Mapped '{result}' to known language '{matches[0]}'")
                         metadata['lang'] = matches[0]
             
-            # --- Step 2: Topic Fallback (if Language is None) ---
+            # Topic fallback if language not detected
             if not metadata['lang']:
                 print("Language not detected. Triggering Topic Fallback...")
                 
@@ -135,7 +130,7 @@ Domain (Return ONLY the category name):"""
         except Exception as e:
             print(f"Metadata extraction failed: {e}")
 
-    # CRITICAL: Force Unload & Cleanup REGARDLESS of path
+    # Cleanup
     print("Ensuring VRAM is clean (Unloading Ollama)...")
     if llm: 
         del llm
@@ -199,14 +194,10 @@ class RAGRetriever:
         
         query_vector = embeddings.embed_query(query)
         
-        # Cleanup Embeddings Model IMMEDIATELY
         del embeddings
         self._clean_memory()
         print("Embeddings unloaded.")
 
-        # Thresholding: 
-        # BGE-M3 Distance < 0.55 (Similarity > 0.45) is a reasonable baseline for 'relevance'
-        # Adjust strictness as needed.
         threshold_dist = 0.55 
         
         # Dynamic SQL Construction for Filtering
@@ -235,7 +226,9 @@ class RAGRetriever:
             rows = cur.fetchall()
             for row in rows:
                 content, meta, dist = row
-                doc = Document(page_content=content, metadata=meta)
+                # Use original_content if available (for L0), fallback to summary
+                actual_content = meta.get('original_content', content)
+                doc = Document(page_content=actual_content, metadata=meta)
                 doc.metadata['score'] = 1 - dist
                 text_docs.append(doc)
         
@@ -284,14 +277,8 @@ class RAGRetriever:
             
         print(f"Recursive Retrieval: Expanding {len(child_refs)} L0 chunks from L1 nodes...")
         
-        # Fetch L0 content from DB
-        # Query: WHERE (metadata->>'source_file', (metadata->>'chunk_id')::int) IN ...
-        
         docs_l0 = []
         with self.conn.cursor() as cur:
-            # We will use a flexible query: match file AND chunk_id
-            # Creating a condition list
-            
             from collections import defaultdict
             file_map = defaultdict(list)
             for src, cid in child_refs:
@@ -316,7 +303,9 @@ class RAGRetriever:
                     content, meta = row
                     # Verify level 0
                     if str(meta.get('level')) == '0':
-                         doc = Document(page_content=content, metadata=meta)
+                         # Use original_content if available, fallback to summary
+                         actual_content = meta.get('original_content', content)
+                         doc = Document(page_content=actual_content, metadata=meta)
                          # Inherit score? No, this is raw retrieval. 
                          # We will let Reranker handle scoring.
                          docs_l0.append(doc)
@@ -371,7 +360,6 @@ class RAGRetriever:
         pairs = [[query, doc.page_content] for doc in docs]
         scores = reranker.predict(pairs, batch_size=4) 
         
-        # Cleanup Reranker IMMEDIATELY
         del reranker
         self._clean_memory()
         print("Reranker unloaded.")

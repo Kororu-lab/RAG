@@ -14,15 +14,14 @@ def retrieve_node(state: GraphState):
     search_count = state.get("search_count", 0)
     existing_docs = state.get("documents", []) # Accumulative
 
-    # VRAM Management: Unload LLM (Ollama) to make space for Embeddings/Reranker
+    # Unload LLM to free VRAM for embeddings
     try:
         from src.utils import LLMUtility
         LLMUtility.unload_model("retrieval")
     except Exception:
         pass
 
-    # Dynamic Top-K & Top-N Strategy (Linked Dynamic Scaling)
-    # Broad queries need more context (Higher K, Higher Top-N)
+    # Dynamic Top-K scaling
     base_k = 5
     base_top_n = 5
     
@@ -46,11 +45,9 @@ def retrieve_node(state: GraphState):
     
     new_docs = retriever.retrieve_documents(question, k=k, top_n=top_n, metadata=metadata)
     
-    # Accumulative Logic: Merge old and new, deduplicate by ref_id
+    # Merge and deduplicate
     combined_docs = []
     seen_ids = set()
-
-    # Deduplication
     for d in existing_docs + new_docs:
         ref_id = d.metadata.get('ref_id')
         if ref_id and ref_id not in seen_ids:
@@ -113,7 +110,6 @@ def generate_node(state: GraphState):
         else:
             level = d.metadata.get('level', '0')
             prefix = "[Summary]" if str(level) == '1' else "[Detail]"
-            # ENRICHMENT: Inject Source Metadata for Generation
             source_info = f"[Source: {d.metadata.get('source_file', 'unknown')}]"
             text_context_lines.append(f"{prefix} Ref: {d.metadata.get('ref_id', 'Chunk')} {source_info}\n{d.page_content}")
 
@@ -122,7 +118,6 @@ def generate_node(state: GraphState):
         context_str += "\n\n[Visual Evidence Found]\n" + "\n---\n".join(vision_context_lines)
         
     if not context_str.strip():
-        # Soft Fallback Handling in Graph will catch this, but here we provide a hint
         context_str = "No relevant documents found."
         
     generation = generate_answer(query=question, context=context_str)
@@ -147,8 +142,7 @@ def check_hallucination_node(state: GraphState):
     else:
         docs_text = full_text
         
-    # --- Refusal Pre-Check ---
-    # Detect if the model correctly refused to answer due to lack of info.
+    # Check for valid refusal
     refusal_keywords = ["정보가 부족", "알 수 없습니다", "문맥에 나타나 있지 않으", "제공된 문맥", "information is missing"]
     if any(k in generation for k in refusal_keywords):
         print("  - DECISION: GROUNDED REFUSAL (Pass)")
