@@ -245,13 +245,15 @@ class RAGRetriever:
         
         vector_results = []  # [(id, distance)]
         doc_cache = {}       # id -> (content, metadata)
+        vector_ranks = {}    # id -> rank (for preserving top vector results)
         
         with self.conn.cursor() as cur:
             cur.execute(vector_sql, tuple(vector_params))
-            for row in cur.fetchall():
+            for rank, row in enumerate(cur.fetchall()):
                 doc_id, content, meta, dist = row
                 vector_results.append((doc_id, 1 - dist))  # Convert to similarity
                 doc_cache[doc_id] = (content, meta)
+                vector_ranks[doc_id] = rank  # Track original vector rank
         
         print(f"Vector Search: {len(vector_results)} matches")
         
@@ -301,18 +303,20 @@ class RAGRetriever:
                 doc = Document(page_content=actual_content, metadata=meta)
                 doc.metadata['score'] = rrf_scores[doc_id]
                 doc.metadata['_db_id'] = doc_id
+                doc.metadata['_vector_rank'] = vector_ranks.get(doc_id, 999)  # Preserve vector rank
                 text_docs.append(doc)
             
             print(f"Hybrid Search (RRF): {len(text_docs)} merged results")
         else:
             # Vector-only fallback
             text_docs = []
-            for doc_id, score in vector_results:
+            for rank, (doc_id, score) in enumerate(vector_results):
                 content, meta = doc_cache[doc_id]
                 actual_content = meta.get('original_content', content)
                 doc = Document(page_content=actual_content, metadata=meta)
                 doc.metadata['score'] = score
                 doc.metadata['_db_id'] = doc_id
+                doc.metadata['_vector_rank'] = rank  # Preserve vector rank
                 text_docs.append(doc)
             
             print(f"Vector Search: {len(text_docs)} results (hybrid disabled)")
@@ -417,6 +421,55 @@ class RAGRetriever:
         print(f"Recursive Retrieval: Added {added_count} unique L0 chunks. Total Context: {len(final_docs)}")
         return final_docs
 
+    def _expand_sibling_chunks(self, docs: List[Document]) -> List[Document]:
+        """
+        [Sibling Chunk Expansion]
+        When chunk:0 (title) is selected by reranker, also fetch chunks 1-N from same source.
+        This ensures detailed content/examples are included, not just titles.
+        """
+        # Collect source files where chunk:0 was selected
+        sources_with_title_only = set()
+        existing_chunks = {}  # source_file -> set of chunk_ids
+        
+        for doc in docs:
+            src = doc.metadata.get('source_file', '')
+            chunk_id = doc.metadata.get('chunk_id', -1)
+            if src not in existing_chunks:
+                existing_chunks[src] = set()
+            existing_chunks[src].add(chunk_id)
+        
+        # Find sources where we only have chunk 0
+        for src, chunks in existing_chunks.items():
+            if chunks == {0} or chunks == {'0'}:
+                sources_with_title_only.add(src)
+        
+        if not sources_with_title_only:
+            return docs
+            
+        print(f"Sibling Expansion: {len(sources_with_title_only)} sources have only title chunk")
+        
+        # Fetch sibling chunks from database
+        sibling_docs = []
+        with self.conn.cursor() as cur:
+            for src in sources_with_title_only:
+                cur.execute("""
+                    SELECT content, metadata 
+                    FROM linguistics_raptor
+                    WHERE metadata->>'source_file' = %s
+                    AND (metadata->>'chunk_id')::int > 0
+                    ORDER BY (metadata->>'chunk_id')::int
+                    LIMIT 10
+                """, (src,))
+                
+                for row in cur.fetchall():
+                    content, meta = row
+                    actual_content = meta.get('original_content', content)
+                    doc = Document(page_content=actual_content, metadata=meta)
+                    sibling_docs.append(doc)
+        
+        print(f"Sibling Expansion: Added {len(sibling_docs)} content chunks")
+        return docs + sibling_docs
+
     def retrieve_vision(self, query: str, metadata: Dict[str, Any]):
         print("Initializing Vision Retriever (ColPali)...")
         vision_retriever = ColPaliRetriever()
@@ -436,6 +489,9 @@ class RAGRetriever:
     def perform_rerank(self, query: str, docs: List[Document], top_n: int = None):
         if top_n is None:
             top_n = self.top_n
+        
+        # Preserve vector top-5 (using _vector_rank metadata)
+        vector_top = [d for d in docs if d.metadata.get('_vector_rank', 999) < 5]
             
         print(f"Loading Reranker ({self.reranker_model_name})...")
         reranker = CrossEncoder(
@@ -453,6 +509,24 @@ class RAGRetriever:
         
         scored_docs = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
         top_n_docs = [doc for doc, score in scored_docs[:top_n]]
+        
+        # Merge preserved vector top with reranked results
+        if vector_top:
+            seen_keys = set()
+            for d in top_n_docs:
+                key = (d.metadata.get('source_file'), d.metadata.get('chunk_id'))
+                seen_keys.add(key)
+            
+            added = 0
+            for d in vector_top:
+                key = (d.metadata.get('source_file'), d.metadata.get('chunk_id'))
+                if key not in seen_keys:
+                    top_n_docs.append(d)
+                    seen_keys.add(key)
+                    added += 1
+            if added > 0:
+                print(f"Vector Top Preserved: {added} docs")
+        
         print(f"Reranked: Reduced from {len(docs)} to {len(top_n_docs)} docs (Top-N={top_n})")
         return top_n_docs
 
@@ -507,6 +581,8 @@ class RAGRetriever:
         if self.use_reranker and text_docs:
             print("Reranking text docs...")
             text_docs = self.perform_rerank(query, text_docs, top_n=top_n)
+            # Expand sibling chunks for docs where only chunk:0 (title) was selected
+            text_docs = self._expand_sibling_chunks(text_docs)
 
         # Merge Text and Vision
         final_docs = text_docs + vision_docs
@@ -612,7 +688,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     # Pre-Flight: Detect Metadata (Language/Topic)
-    config = load_config()
+    config = src.utils.load_config()
     metadata = extract_query_metadata(args.query, config)
     
     # Initialize RAGRetriever (Loads Embeddings, Reranker, ColPali + Postgres)

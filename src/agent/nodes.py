@@ -25,7 +25,17 @@ def retrieve_node(state: GraphState):
     base_k = 5
     base_top_n = 5
     
-    broad_keywords = ["모든", "목록", "종류", "전체", "list", "types", "all", "overview", "언어들", "데이터베이스", "db", "비교", "차이", "features", "특징", "구조"]
+    broad_keywords = [
+        # General
+        "모든", "목록", "종류", "전체", "list", "types", "all", "overview", 
+        "언어들", "데이터베이스", "db", "비교", "차이", "features", "특징", "구조",
+        # Linguistics topics
+        "상", "aspect", "시상", "tense", "양태", "modality", "mood",
+        "연동", "serial", "svc", "구문", "construction",
+        "음운", "phonology", "phoneme", "자음", "모음", "vowel", "consonant",
+        "어순", "word order", "화제", "topic", "주어", "subject",
+        "격", "case", "표지", "marker", "접사", "affix"
+    ]
     if any(k in question.lower() for k in broad_keywords):
         print(f"  - Dynamic Scaling: Broad query detected ('{question}').")
         k = 30
