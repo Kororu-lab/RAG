@@ -103,11 +103,13 @@ class ColPaliRetriever:
             idx_val = idx.item()
             metadata = self._metadata[idx_val]
             
-            # Metadata Filtering
+            # Metadata Filtering (supports single lang or list)
             if lang_filter:
-                # specific check: is lang_filter in parent_path?
-                # parent_path e.g. "doc/takpa/..."
-                if lang_filter.lower() not in metadata.get("parent_path", "").lower():
+                # Normalize to list
+                langs = lang_filter if isinstance(lang_filter, list) else [lang_filter]
+                parent_path = metadata.get("parent_path", "").lower()
+                # Check if any of the languages match
+                if not any(lang.lower() in parent_path for lang in langs):
                     continue
             
             results.append({

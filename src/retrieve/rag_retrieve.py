@@ -52,7 +52,6 @@ def extract_query_metadata(query: str, config: Dict[str, Any]) -> Dict[str, Any]
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     # Language Detection
-    
     # Fast Path: Check against known directory names
     data_path = config["project"]["data_path"]
     doc_dir = os.path.join(data_path, "doc")
@@ -62,23 +61,24 @@ def extract_query_metadata(query: str, config: Dict[str, Any]) -> Dict[str, Any]
         
     query_lower = query.lower()
     
-    # Check Fast Path
-    for lang in known_languages:
-        if lang in query_lower:
-            metadata['lang'] = lang
-            break
+    # [COMMENTED OUT] Fast Path - kept for future optimization if LLM latency becomes an issue
+    # detected_langs = []
+    # for lang in known_languages:
+    #     if lang in query_lower:
+    #         detected_langs.append(lang)
+    # if detected_langs:
+    #     metadata['lang'] = detected_langs if len(detected_langs) > 1 else detected_langs[0]
 
-    # LLM fallback
+    # LLM-based language detection (handles Korean, Chinese, English names)
     llm = None
-    if not metadata['lang']:
-        print("Simple detection failed. Using LLM for language detection...")
-        llm_name = config.get("llm_retrieval", config.get("llm", {})).get("model_name")
+    print("Using LLM for language detection...")
+    llm_name = config.get("llm_retrieval", config.get("llm", {})).get("model_name")
+    
+    try:
+        llm = get_llm("retrieval")
         
-        try:
-            llm = get_llm("retrieval")
-            
-            lang_prompt = ChatPromptTemplate.from_template(
-                """Analyze the user's query and identify if a specific language is being asked about.
+        lang_prompt = ChatPromptTemplate.from_template(
+            """Analyze the user's query and identify if a specific language is being asked about.
 If found, translate it to its standard English Academic name.
 If no specific language is targeted, return "None".
 
@@ -88,21 +88,40 @@ If no specific language is targeted, return "None".
 
 Query: {query}
 Language Name (English only, no punctuation):"""
-            )
+        )
+        
+        chain = lang_prompt | llm | StrOutputParser()
+        result = chain.invoke({"query": query}).strip()
+        print(f"LLM Detected Language: {result}")
+        
+        if result and result != "None":
+            # Parse multi-language output (e.g., "Takpa Achang" or "Takpa, Achang")
+            import re
+            lang_tokens = re.split(r'[,\s]+', result.lower())
+            detected_langs = []
             
-            chain = lang_prompt | llm | StrOutputParser()
-            result = chain.invoke({"query": query}).strip()
-            print(f"LLM Detected Language: {result}")
-            
-            if result and result != "None":
-                clean_result = result.lower()
-                if clean_result in known_languages:
-                    metadata['lang'] = clean_result
+            for token in lang_tokens:
+                token = token.strip()
+                if not token:
+                    continue
+                if token in known_languages:
+                    detected_langs.append(token)
                 else:
-                    matches = difflib.get_close_matches(clean_result, known_languages, n=1, cutoff=0.6)
+                    matches = difflib.get_close_matches(token, known_languages, n=1, cutoff=0.6)
                     if matches:
-                        print(f"Mapped '{result}' to known language '{matches[0]}'")
-                        metadata['lang'] = matches[0]
+                        print(f"Mapped '{token}' to known language '{matches[0]}'")
+                        detected_langs.append(matches[0])
+            
+            # Deduplicate and set metadata
+            detected_langs = list(dict.fromkeys(detected_langs))  # Preserve order, remove dups
+            if len(detected_langs) > 3:
+                print(f"Multi-language query: {len(detected_langs)} languages, disabling filter")
+                metadata['lang'] = None
+            elif len(detected_langs) > 1:
+                print(f"Multi-language query detected: {detected_langs}")
+                metadata['lang'] = detected_langs
+            elif len(detected_langs) == 1:
+                metadata['lang'] = detected_langs[0]
             
             # Topic fallback if language not detected
             if not metadata['lang']:
@@ -135,8 +154,8 @@ Domain (Return ONLY the category name):"""
                     
                 print(f"LLM Detected Topic: {metadata['topic']}")
                 
-        except Exception as e:
-            print(f"Metadata extraction failed: {e}")
+    except Exception as e:
+        print(f"Metadata extraction failed: {e}")
 
     # Cleanup
     print("Ensuring VRAM is clean (Unloading Ollama)...")
@@ -230,9 +249,17 @@ class RAGRetriever:
         lang_param = []
         if metadata and metadata.get('lang'):
             lang = metadata['lang']
-            print(f"Applying Language Filter: {lang}")
-            lang_filter = " AND metadata->>'lang' = %s"
-            lang_param = [lang]
+            if isinstance(lang, list):
+                # Multi-language query - use IN clause
+                placeholders = ','.join(['%s'] * len(lang))
+                lang_filter = f" AND metadata->>'lang' IN ({placeholders})"
+                lang_param = lang
+                print(f"Applying Multi-Language Filter: {lang}")
+            else:
+                # Single language
+                print(f"Applying Language Filter: {lang}")
+                lang_filter = " AND metadata->>'lang' = %s"
+                lang_param = [lang]
         
         # 1. Vector Search
         vector_sql = f"""

@@ -21,30 +21,39 @@ def retrieve_node(state: GraphState):
     except Exception:
         pass
 
-    # Dynamic Top-K scaling
-    base_k = 5
-    base_top_n = 5
+    # Dynamic Top-K scaling (3-tier)
+    # Base: 15 for normal queries
+    # Mid-broad: 30 for topic-specific linguistics queries  
+    # Super-broad: 60 for exhaustive queries (all, compare, list)
     
-    broad_keywords = [
-        # General
-        "모든", "목록", "종류", "전체", "list", "types", "all", "overview", 
-        "언어들", "데이터베이스", "db", "비교", "차이", "features", "특징", "구조",
-        # Linguistics topics
+    super_broad_keywords = [
+        "모든", "목록", "전체", "list", "all", "overview", "언어들",
+        "데이터베이스", "db", "비교", "compare", "차이", "difference"
+    ]
+    
+    mid_broad_keywords = [
+        # Topic-specific linguistics terms
         "상", "aspect", "시상", "tense", "양태", "modality", "mood",
         "연동", "serial", "svc", "구문", "construction",
         "음운", "phonology", "phoneme", "자음", "모음", "vowel", "consonant",
         "어순", "word order", "화제", "topic", "주어", "subject",
-        "격", "case", "표지", "marker", "접사", "affix"
+        "격", "case", "표지", "marker", "접사", "affix",
+        "종류", "types", "features", "특징", "구조", "structure"
     ]
-    if any(k in question.lower() for k in broad_keywords):
-        print(f"  - Dynamic Scaling: Broad query detected ('{question}').")
-        k = 30
-        top_n = 15 # Allow more docs to pass reranker
-        print(f"    -> Increasing k={k}, top_n={top_n}")
+    
+    q_lower = question.lower()
+    
+    if any(kw in q_lower for kw in super_broad_keywords):
+        k, top_n = 60, 25
+        print(f"  - Dynamic Scaling: Super-broad query detected.")
+        print(f"    -> k={k}, top_n={top_n}")
+    elif any(kw in q_lower for kw in mid_broad_keywords):
+        k, top_n = 30, 15
+        print(f"  - Dynamic Scaling: Mid-broad (topic-specific) query detected.")
+        print(f"    -> k={k}, top_n={top_n}")
     else:
-        print(f"  - Dynamic Scaling: Specific query detected. Keeping base k={base_k}, top_n={base_top_n}.")
-        k = base_k
-        top_n = base_top_n
+        k, top_n = 15, 10
+        print(f"  - Dynamic Scaling: Normal query. k={k}, top_n={top_n}")
 
 
     retriever = RAGRetriever()
