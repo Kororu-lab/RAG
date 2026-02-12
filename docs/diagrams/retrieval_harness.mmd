@@ -1,0 +1,13 @@
+flowchart LR
+  QS[Query Set (JSONL/YAML)<br/>Q-only in Late QA] --> HR[Harness Runner<br/>src/eval/run_retrieval_ablation.py]
+  CP[Condition Profiles<br/>baseline/hybrid/viking_soft/viking_strict/raptor_on] --> HR
+  CFG[Config Overlay (no UI)<br/>patch load_config or pass overrides] --> HR
+
+  HR --> RET[RAGRetriever.retrieve_documents()<br/>retriever-core only]
+  RET --> AUD[audit.jsonl<br/>per query × condition<br/>scope/trace/fallback/docs/scores/timing]
+  RET --> MET[metrics.json<br/>run meta: git hash + config hash + query hash<br/>summaries per condition]
+  AUD --> POST[Optional metrics post-process<br/>Hit@k/MRR/contam/coverage if labels exist]
+  MET --> POST
+
+  POST --> BK[Artifact policy<br/>Git: small manifests/metrics<br/>Backup: large logs in ~/backupRAG/&lt;run_id&gt;]
+

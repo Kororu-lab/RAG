@@ -9,7 +9,6 @@ corrupt_samples/*
 # Config files
 config.yaml
 notes/*
-docs/*
 prompts/*
 
 # Python cache
