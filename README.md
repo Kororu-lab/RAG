@@ -49,7 +49,7 @@ flowchart LR
     SIB --> CTX[Final Context Pack]
   end
 
-  %%{init: {"flowchart": {"curve": "basis", "nodeSpacing": 70, "rankSpacing": 90}}}%%
+%%{init: {"flowchart": {"curve": "basis", "nodeSpacing": 70, "rankSpacing": 90}}}%%
 flowchart LR
   Q[User Query] --> UI[Streamlit UI]
   UI --> G[LangGraph App]
@@ -71,9 +71,6 @@ flowchart LR
 
 ### B. Retriever-core Ablation Harness
 
-![Retriever Core Harness](docs/diagrams/retrieval_harness.png)
-
-Mermaid source: `docs/diagrams/retrieval_harness.mmd`
 
 - harness는 `retrieve_documents()` 중심 경로만 사용.
 - UI(`src/ui/graph_web.py`) / LangGraph runtime import에 의존하지 않는 retriever-core 평가용 경로
