@@ -12,3 +12,7 @@ config.yaml
 # Python cache
 __pycache__/
 *.pyc
+
+# Block any possibility of privacy leakage
+AGENTS.md
+CLAUDE.md

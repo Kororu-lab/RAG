@@ -1,8 +1,81 @@
+import threading
 from typing import Any, Dict
+
+import src.utils
 from src.agent.state import GraphState
 from src.retrieve.rag_retrieve import RAGRetriever, extract_query_metadata
 from src.agent.chains import get_grade_chain, get_rewrite_chain, get_hallucination_chain
 from src.llm.rag_generate import generate_answer
+
+def _build_structured_metadata(d) -> Dict[str, str]:
+    """
+    Build structured metadata from source_file split.
+    Fallback is used only when split fields are missing.
+    """
+    source_file = str(d.metadata.get("source_file", "unknown"))
+    parts = [p for p in source_file.split("/") if p]
+
+    language = d.metadata.get("lang")
+    if not language:
+        if len(parts) >= 2 and parts[0] == "doc":
+            language = parts[1]
+        else:
+            language = "unknown"
+
+    filename = parts[-1] if parts else "unknown"
+
+    topic = parts[-2] if len(parts) >= 2 else ""
+    if not topic:
+        # Error-only fallback
+        fallback_header = str(d.metadata.get("original_header", "")).strip()
+        topic = fallback_header or "unknown"
+
+    return {
+        "Language": str(language),
+        "Filename": str(filename),
+        "Topic": str(topic),
+        "SourceFile": source_file,
+    }
+
+
+def _format_structured_block(meta: Dict[str, str]) -> str:
+    return (
+        "[Structured Metadata]\n"
+        f"Language: {meta['Language']}\n"
+        f"Filename: {meta['Filename']}\n"
+        f"Topic: {meta['Topic']}\n"
+        f"SourceFile: {meta['SourceFile']}"
+    )
+
+def _get_generation_timeout_sec(default_sec: int = 60) -> int:
+    try:
+        config = src.utils.load_config()
+        sec = int(config.get("rag", {}).get("generation_timeout_sec", default_sec))
+        return sec if sec > 0 else default_sec
+    except Exception:
+        return default_sec
+
+def _generate_with_timeout(query: str, context: str, timeout_sec: int) -> str:
+    result = {"value": None, "error": None}
+
+    def _worker():
+        try:
+            result["value"] = generate_answer(query=query, context=context)
+        except Exception as e:
+            result["error"] = e
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout=timeout_sec)
+
+    if t.is_alive():
+        return f"정보가 부족합니다\n\n(답변 생성 시간 제한 {timeout_sec}초를 초과했습니다.)"
+
+    if result["error"] is not None:
+        raise result["error"]
+
+    return result["value"]
+
 
 def retrieve_node(state: GraphState):
     """
@@ -93,8 +166,13 @@ def grade_documents_node(state: GraphState):
     relevance_count = 0
     
     for d in documents:
-        source_info = f"[Source]: {d.metadata.get('source_file', 'unknown')}"
-        rich_content = f"{source_info}\n{d.page_content}"
+        structured_meta = _build_structured_metadata(d)
+        source_info = f"[Source]: {structured_meta['SourceFile']}"
+        rich_content = (
+            f"{_format_structured_block(structured_meta)}\n"
+            "[Document Content]\n"
+            f"{d.page_content}"
+        )
         
         score = grader.invoke({"question": question, "document": rich_content})
         
@@ -127,10 +205,16 @@ def generate_node(state: GraphState):
         if d.metadata.get('type') == 'vision':
             vision_context_lines.append(d.page_content)
         else:
+            structured_meta = _build_structured_metadata(d)
             level = d.metadata.get('level', '0')
             prefix = "[Summary]" if str(level) == '1' else "[Detail]"
-            source_info = f"[Source: {d.metadata.get('source_file', 'unknown')}]"
-            text_context_lines.append(f"{prefix} Ref: {d.metadata.get('ref_id', 'Chunk')} {source_info}\n{d.page_content}")
+            source_info = f"[Source: {structured_meta['SourceFile']}]"
+            text_context_lines.append(
+                f"{prefix} Ref: {d.metadata.get('ref_id', 'Chunk')} {source_info}\n"
+                f"{_format_structured_block(structured_meta)}\n"
+                "[Document Content]\n"
+                f"{d.page_content}"
+            )
 
     context_str = "\n\n".join(text_context_lines)
     if vision_context_lines:
@@ -138,8 +222,9 @@ def generate_node(state: GraphState):
         
     if not context_str.strip():
         context_str = "No relevant documents found."
-        
-    generation = generate_answer(query=question, context=context_str)
+
+    timeout_sec = _get_generation_timeout_sec(default_sec=60)
+    generation = _generate_with_timeout(query=question, context=context_str, timeout_sec=timeout_sec)
     return {"documents": documents, "question": question, "generation": generation}
 
 def check_hallucination_node(state: GraphState):
