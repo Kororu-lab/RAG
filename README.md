@@ -24,7 +24,7 @@ flowchart LR
 
   subgraph RETR["Retrieval Core"]
     VS --> VEC[Vector search\n(scoped)]
-    VEC --> FB{soft & hits < min_hits\n& attempts < max_exp?}
+    VEC --> FB{soft & hits &lt; min_hits\n& attempts &lt; max_exp?}
 
     FB -- yes --> WIDEN[Widen scope\nphenom→cat→lang→global]
     WIDEN --> VEC
@@ -34,12 +34,12 @@ flowchart LR
     MODE -- strict --> BMF[BM25 pre-filter\n(in-scope only)]
     MODE -- soft --> SKIP[Skip BM25 pre-filter]
 
-    BMF --> FCHK{hybrid on\n& BM25>0?}
+    BMF --> FCHK{hybrid on\n& BM25&gt;0?}
     SKIP --> FCHK
 
     FCHK -- yes --> RRF[RRF fusion\n(vector + BM25 candidates)]
     FCHK -- no --> VONLY[Vector-only]
-    RRF --> GUARD[Scope guard\nstrict: hard drop\nsoft: drop OOS unless in-scope<3]
+    RRF --> GUARD[Scope guard\nstrict: hard drop\nsoft: drop OOS unless in-scope&lt;3]
     VONLY --> GUARD
   end
 
@@ -50,6 +50,9 @@ flowchart LR
     SIB --> CTX[Final Context Pack]
   end
 
+```
+
+```mermaid
 %%{init: {"flowchart": {"curve": "basis", "nodeSpacing": 70, "rankSpacing": 90}}}%%
 flowchart LR
   Q[User Query] --> UI[Streamlit UI]
@@ -65,6 +68,7 @@ flowchart LR
   DEC -- yes --> GEN[generate node]
   GEN --> HC[check_hallucination\n(optional skip)]
   HC --> OUT[Answer + References]
+```
 
 - `RRF Fusion`은 **최종 top-k 결정 단계가 아닌**, 벡터/BM25 **후보 결합 단계**
 - BM25 pre-filter는 **strict 모드에서만** 적용
@@ -92,7 +96,7 @@ flowchart LR
   end
 
   COND --> HR
-  HR --> OUT[Run directory\n--out-dir <path>\n(one run_id)]
+  HR --> OUT[Run directory\n--out-dir &lt;path&gt;\n(one run_id)]
   OUT --> AUD
   OUT --> MET
 
@@ -100,6 +104,7 @@ flowchart LR
   NOTE -.-> HR
 
   classDef warn fill:#fff3cd,stroke:#d39e00,color:#000;
+```
 
 - harness는 `retrieve_documents()` 중심 경로만 사용.
 - UI(`src/ui/graph_web.py`) / LangGraph runtime import에 의존하지 않는 retriever-core 평가용 경로
@@ -199,4 +204,3 @@ UI는 strict에서 0 docs가 나오면 경고를 표시하도록 의도됨.
 
 - fallback이 너무 자주 발생하면 `min_hits`++
 - fallback 확장이 부족하면 `max_expansions`++
-
