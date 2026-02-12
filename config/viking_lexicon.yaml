@@ -1,0 +1,122 @@
+# Test Viking Lexicon configuration file
+## WILL BE DELETED SOON - ONLY FOR TESTING PURPOSES
+## viking은 이후 llm-routing으로 통합 예정
+
+phenomenon:
+  # Phonology phenomena
+  consonant: ["11_cons"]
+  "자음": ["11_cons"]
+  vowel: ["12_vowel"]
+  "모음": ["12_vowel"]
+  suprasegmental: ["13_supra"]
+  tone: ["13_supra"]
+  "성조": ["13_supra"]
+  stress: ["13_supra"]
+  accent: ["13_supra"]
+  syllable: ["14_sylstr"]
+  "음절": ["14_sylstr"]
+  phonological process: ["15_phonproc"]
+  "음운 변동": ["15_phonproc"]
+  assimilation: ["15_phonproc"]
+  "동화": ["15_phonproc"]
+
+  # Word classes
+  noun: ["22_noun"]
+  "명사": ["22_noun"]
+  verb: ["23_verb"]
+  "동사": ["23_verb"]
+  adjective: ["24_adj"]
+  "형용사": ["24_adj"]
+  adverb: ["25_adv"]
+  "부사": ["25_adv"]
+  exclamation: ["26_exclam"]
+  "감탄사": ["26_exclam"]
+  numeral: ["27_num"]
+  "수사": ["27_num"]
+  classifier: ["28_clf"]
+  "분류사": ["28_clf"]
+  pronoun: ["31_pro"]
+  "대명사": ["31_pro"]
+  determiner: ["32_det"]
+  "한정사": ["32_det"]
+  adposition: ["33_adp"]
+  "후치사": ["33_adp"]
+  "전치사": ["33_adp"]
+  conjunction: ["34_conj"]
+  "접속사": ["34_conj"]
+  auxiliary: ["35_aux"]
+  "보조동사": ["35_aux"]
+  particle: ["36_ptcl"]
+  "조사": ["36_ptcl"]
+
+  # Sentence structure
+  clause: ["41_cl"]
+  "절": ["41_cl"]
+  noun phrase: ["42_np"]
+  "명사구": ["42_np"]
+  clause type: ["43_ctype"]
+  "절 유형": ["43_ctype"]
+  sentence type: ["44_stype"]
+  "문장 유형": ["44_stype"]
+  word order: ["45_wo"]
+  "어순": ["45_wo"]
+  valence: ["46_val"]
+  "결합가": ["46_val"]
+  information structure: ["45_info", "47_info"]
+  "정보 구조": ["45_info", "47_info"]
+  "화제": ["45_info", "47_info"]
+  focus: ["45_info", "47_info"]
+  "초점": ["45_info", "47_info"]
+  tam: ["48_tame"]
+  tense: ["48_tame"]
+  aspect: ["48_tame"]
+  mood: ["48_tame"]
+  "시상": ["48_tame"]
+  "시제": ["48_tame"]
+  "양태": ["48_tame"]
+  negation: ["51_neg"]
+  "부정": ["51_neg"]
+  possession: ["52_poss"]
+  "소유": ["52_poss"]
+  comparison: ["53_comp"]
+  "비교": ["53_comp"]
+
+  # Complex sentences
+  clause linking: ["61_clink"]
+  "절 연결": ["61_clink"]
+  subordination: ["62_subr"]
+  "종속": ["62_subr"]
+  serial verb: ["63_svc"]
+  "연동": ["63_svc"]
+  control: ["64_control"]
+  "통제": ["64_control"]
+
+  # Semantics
+  semantics: ["71_semantics"]
+  "의미": ["71_semantics"]
+  pragmatics: ["72_pragmatics"]
+  "화용": ["72_pragmatics"]
+
+  # Broad topic mappings (map to multiple phenomena)
+  phonology: ["11_cons", "12_vowel", "13_supra", "14_sylstr", "15_phonproc"]
+  "음운론": ["11_cons", "12_vowel", "13_supra", "14_sylstr", "15_phonproc"]
+  morphology: ["22_noun", "23_verb", "24_adj"]
+  "형태론": ["22_noun", "23_verb", "24_adj"]
+  syntax: ["41_cl", "42_np", "43_ctype", "44_stype", "45_wo"]
+  "통사론": ["41_cl", "42_np", "43_ctype", "44_stype", "45_wo"]
+
+category:
+  phonology: "1_phonology"
+  "음운론": "1_phonology"
+  word class: "2_wordclass"
+  "품사": "2_wordclass"
+  sentence structure: "4_ss"
+  "문장 구조": "4_ss"
+  "통사론": "4_ss"
+  syntax: "4_ss"
+  complex sentence: "6_cs"
+  "복합문": "6_cs"
+  semantics: "7_semantics"
+  "의미론": "7_semantics"
+  lexicology: "8_lexicology"
+  "어휘론": "8_lexicology"

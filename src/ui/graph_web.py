@@ -93,7 +93,16 @@ with st.sidebar:
     vision_enabled = st.checkbox("Vision Search", value=False)
     generation_timeout_sec = st.number_input("Generation Timeout (sec)", min_value=10, max_value=600, value=60, step=5)
     show_original_html = st.checkbox("Show Original HTML for Retrieved Refs", value=True)
-    
+
+    st.subheader("Viking Routing")
+    viking_enabled = st.checkbox("Viking Routing", value=False)
+    viking_soft = st.checkbox("Viking Soft Fallback", value=True)
+    viking_max_exp = st.number_input("Viking Max Expansions", min_value=0, max_value=5, value=2, step=1)
+
+    st.subheader("Pipeline Controls")
+    grading_enabled = st.checkbox("Document Grading", value=True)
+    hallucination_check_enabled = st.checkbox("Hallucination Check", value=True)
+
     st.divider()
     
     # Config Patching
@@ -114,10 +123,19 @@ with st.sidebar:
         retrieval.setdefault("hybrid_search", {})["enabled"] = bm25_enabled
         retrieval["recursive_retrieval"] = recursive_enabled
         retrieval["vision_search"] = vision_enabled
+
+        # Viking routing override
+        viking = retrieval.setdefault("viking", {})
+        viking["enabled"] = viking_enabled
+        viking["mode"] = "soft" if viking_soft else "strict"
+        viking["max_expansions"] = int(viking_max_exp)
         
         # Reranker override
         config.setdefault("reranker", {})["enabled"] = reranker_enabled
-        config.setdefault("rag", {})["generation_timeout_sec"] = int(generation_timeout_sec)
+        rag = config.setdefault("rag", {})
+        rag["generation_timeout_sec"] = int(generation_timeout_sec)
+        rag["skip_grading"] = not grading_enabled
+        rag["skip_hallucination"] = not hallucination_check_enabled
         
         return config
 
@@ -160,69 +178,163 @@ if prompt := st.chat_input("Enter your query"):
 
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
-        
-        with st.expander("Terminal Output (Real-time)", expanded=True):
-            log_placeholder = st.empty()
-            log_placeholder.code("Initializing...\n", language="text")
 
         full_response = ""
         final_answer_found = False
+        generate_output = None
         original_stdout = sys.stdout
-        logger = StreamlitLogger(original_stdout, log_placeholder)
 
-        try:
-            sys.stdout = logger
-            inputs = {"question": prompt, "search_count": 0}
-            
-            for output in app.stream(inputs):
-                for key, value in output.items():
-                    if key == "generate" and "generation" in value:
-                        final_generation = value["generation"]
-                        message_placeholder.markdown(final_generation)
-                        full_response = final_generation
-                        final_answer_found = True
-                        
-                        if "documents" in value:
-                            refs = "\n\n**Reference Sources:**\n"
-                            seen_refs = set()
-                            for doc in value["documents"]:
-                                ref_id = doc.metadata.get('ref_id', 'Unknown')
-                                if ref_id not in seen_refs:
-                                    level = doc.metadata.get('level', '0')
-                                    prefix = "Summary" if str(level) == '1' else "Detail"
-                                    refs += f"- `[{prefix}]` {ref_id}\n"
-                                    seen_refs.add(ref_id)
-                            
-                            full_response += refs
+        with st.status("Running pipeline...", expanded=True) as pipeline_status:
+            step_placeholder = st.empty()
+            step_log = []
+            pipeline_errored = False
+            strict_zero_doc_warned = False
+
+            with st.expander("Terminal Output", expanded=False):
+                log_placeholder = st.empty()
+                log_placeholder.code("Initializing...\n", language="text")
+
+            logger = StreamlitLogger(original_stdout, log_placeholder)
+
+            try:
+                sys.stdout = logger
+                inputs = {"question": prompt, "search_count": 0}
+
+                for output in app.stream(inputs):
+                    for key, value in output.items():
+                        if key == "retrieve":
+                            n = len(value.get("documents", []))
+                            viking_tag = ""
+                            if viking_enabled:
+                                viking_tag = " (Viking)"
+                                # Extract scope details from first doc metadata
+                                docs = value.get("documents", [])
+                                scope_info = None
+                                for d in docs:
+                                    scope_info = d.metadata.get("_viking_scope")
+                                    if scope_info:
+                                        break
+                                if scope_info:
+                                    parts = []
+                                    if scope_info.get("languages"):
+                                        parts.append(f"lang={scope_info['languages']}")
+                                    if scope_info.get("phenomena"):
+                                        parts.append(f"phenomena={scope_info['phenomena']}")
+                                    elif scope_info.get("categories"):
+                                        parts.append(f"categories={scope_info['categories']}")
+                                    parts.append(f"conf={scope_info.get('confidence', '?')}")
+                                    parts.append(f"patterns={scope_info.get('patterns', 0)}")
+                                    viking_tag += f" `[{', '.join(parts)}]`"
+                                    trace = scope_info.get("trace", [])
+                                    if any("widened" in t for t in trace):
+                                        viking_tag += " *(fallback)*"
+                            step_log.append(f"**Retrieve**{viking_tag} — {n} documents")
+                            if viking_enabled and (not viking_soft) and n == 0:
+                                step_log.append(
+                                    "**Viking Strict Warning** — 0 docs in current strict scope. "
+                                    "Try soft mode, increase max expansions, or tune min_hits."
+                                )
+                                if not strict_zero_doc_warned:
+                                    st.warning(
+                                        "Viking strict scope returned 0 documents. "
+                                        "Suggested actions: switch to soft mode, "
+                                        "increase Viking Max Expansions, adjust min_hits."
+                                    )
+                                    strict_zero_doc_warned = True
+                            if grading_enabled:
+                                pipeline_status.update(label="Grading documents...")
+                            else:
+                                pipeline_status.update(label="Generating answer...")
+
+                        elif key == "grade_documents":
+                            n = len(value.get("documents", []))
+                            if grading_enabled:
+                                step_log.append(f"**Grade Documents** — {n} relevant")
+                            else:
+                                step_log.append(f"**Grade Documents** — skipped (all {n} passed)")
+                            pipeline_status.update(label="Generating answer...")
+
+                        elif key == "rewrite":
+                            q = value.get("question", "")
+                            count = value.get("search_count", "?")
+                            step_log.append(f"**Rewrite Query** (attempt {count}) — {q[:100]}")
+                            pipeline_status.update(label="Re-retrieving...")
+
+                        elif key == "generate" and "generation" in value:
+                            step_log.append("**Generate** — Answer produced")
+                            if hallucination_check_enabled:
+                                pipeline_status.update(label="Checking hallucination...")
+                            else:
+                                pipeline_status.update(label="Finalizing...")
+                            generate_output = value
+                            full_response = value["generation"]
+                            final_answer_found = True
                             message_placeholder.markdown(full_response)
 
-                            if show_original_html and HTML_SOURCE_SCOPE == "retrieved_refs_only":
-                                st.markdown("**Original Source HTML (Retrieved Refs):**")
-                                seen_sources = set()
-                                for doc in value["documents"]:
-                                    source_file = str(doc.metadata.get("source_file", "")).strip()
-                                    ref_id = doc.metadata.get("ref_id", "Unknown")
-                                    if not source_file or source_file in seen_sources:
-                                        continue
-                                    seen_sources.add(source_file)
+                        elif key == "check_hallucination":
+                            if hallucination_check_enabled:
+                                h = value.get("hallucination_status", "unknown")
+                                label = "GROUNDED" if h == "pass" else "FAILED"
+                                step_log.append(f"**Hallucination Check** — {label}")
+                            else:
+                                step_log.append("**Hallucination Check** — skipped")
+                            if "generation" in value:
+                                full_response = value["generation"]
+                                generate_output = value
+                                message_placeholder.markdown(full_response)
 
-                                    with st.expander(f"{ref_id} | {source_file}", expanded=False):
-                                        html_text, html_err, resolved_path = _load_original_html(source_file)
-                                        if html_err:
-                                            st.warning(html_err)
-                                            if resolved_path:
-                                                st.caption(f"Resolved path: `{resolved_path}`")
-                                        else:
-                                            components.html(html_text, height=500, scrolling=True)
-                                            st.caption(f"Source: `{source_file}`")
+                        step_placeholder.markdown("\n".join(f"- {s}" for s in step_log))
 
-        except Exception as e:
-            st.error(f"An error occurred: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            sys.stdout = original_stdout
-            
+            except Exception as e:
+                st.error(f"An error occurred: {e}")
+                import traceback
+                traceback.print_exc()
+                pipeline_errored = True
+                pipeline_status.update(label="Pipeline error", state="error")
+            finally:
+                sys.stdout = original_stdout
+
+            if not pipeline_errored:
+                if final_answer_found:
+                    pipeline_status.update(label="Pipeline complete", state="complete", expanded=False)
+                else:
+                    pipeline_status.update(label="Pipeline finished (no answer)", state="complete")
+
+        # Display references and original HTML after pipeline completes
+        if final_answer_found and generate_output and "documents" in generate_output:
+            refs = "\n\n**Reference Sources:**\n"
+            seen_refs = set()
+            for doc in generate_output["documents"]:
+                ref_id = doc.metadata.get('ref_id', 'Unknown')
+                if ref_id not in seen_refs:
+                    level = doc.metadata.get('level', '0')
+                    prefix = "Summary" if str(level) == '1' else "Detail"
+                    refs += f"- `[{prefix}]` {ref_id}\n"
+                    seen_refs.add(ref_id)
+
+            full_response += refs
+            message_placeholder.markdown(full_response)
+
+            if show_original_html and HTML_SOURCE_SCOPE == "retrieved_refs_only":
+                st.markdown("**Original Source HTML (Retrieved Refs):**")
+                seen_sources = set()
+                for doc in generate_output["documents"]:
+                    source_file = str(doc.metadata.get("source_file", "")).strip()
+                    ref_id = doc.metadata.get("ref_id", "Unknown")
+                    if not source_file or source_file in seen_sources:
+                        continue
+                    seen_sources.add(source_file)
+
+                    with st.expander(f"{ref_id} | {source_file}", expanded=False):
+                        html_text, html_err, resolved_path = _load_original_html(source_file)
+                        if html_err:
+                            st.warning(html_err)
+                            if resolved_path:
+                                st.caption(f"Resolved path: `{resolved_path}`")
+                        else:
+                            components.html(html_text, height=500, scrolling=True)
+                            st.caption(f"Source: `{source_file}`")
+
         if final_answer_found:
             st.session_state.messages.append({"role": "assistant", "content": full_response})
         else:

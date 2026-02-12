@@ -52,6 +52,12 @@ retrieval:
     bm25_weight: 0.4
     rrf_k: 60
     index_path: "data/bm25_index.pkl"
+  viking:
+    enabled: false        # OpenViking-style hierarchy routing (restricts search space)
+    mode: "soft"          # "soft" = widen scope on low hits; "strict" = no fallback
+    max_expansions: 2     # Max widening steps in soft mode (phenomena→category→lang→all)
+    min_hits: 3           # Minimum vector results before triggering soft fallback
+    lexicon_path: "config/viking_lexicon.yaml"  # External lexicon file (term→taxonomy mappings)
 
 reranker:
   enabled: true

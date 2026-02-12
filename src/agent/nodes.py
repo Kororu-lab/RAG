@@ -159,7 +159,13 @@ def grade_documents_node(state: GraphState):
     print("---CHECK DOCUMENT RELEVANCE---")
     question = state["question"]
     documents = state["documents"]
-    
+
+    # Skip grading if disabled via config
+    config = src.utils.load_config()
+    if config.get("rag", {}).get("skip_grading", False):
+        print("---SKIP DOCUMENT GRADING (disabled)---")
+        return {"documents": documents, "question": question}
+
     grader = get_grade_chain()
     filtered_docs = []
     
@@ -235,7 +241,13 @@ def check_hallucination_node(state: GraphState):
     question = state["question"]
     documents = state["documents"]
     generation = state["generation"]
-    
+
+    # Skip hallucination check if disabled via config
+    config = src.utils.load_config()
+    if config.get("rag", {}).get("skip_hallucination", False):
+        print("---SKIP HALLUCINATION CHECK (disabled)---")
+        return {"documents": documents, "generation": generation, "hallucination_status": "pass"}
+
     checker = get_hallucination_chain()
     
     # Prepare documents text for checker

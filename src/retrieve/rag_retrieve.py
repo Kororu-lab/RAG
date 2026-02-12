@@ -212,6 +212,13 @@ class RAGRetriever:
         retrieval_cfg = self.config.get("retrieval", {})
         self.vision_enabled = retrieval_cfg.get("vision_search", True)
         self.recursive_enabled = retrieval_cfg.get("recursive_retrieval", True)
+
+        # Viking routing config
+        viking_cfg = retrieval_cfg.get("viking", {})
+        self.viking_enabled = viking_cfg.get("enabled", False)
+        self.viking_mode = viking_cfg.get("mode", "soft")
+        self.viking_max_expansions = viking_cfg.get("max_expansions", 2)
+        self.viking_min_hits = viking_cfg.get("min_hits", 3)
         
         self.vision_keywords = ["도표", "table", "chart", "structure", "구조", "IPA", "paradigm", "gloss", "마커", "marker", "예시", "box", "박스"]
 
@@ -227,7 +234,89 @@ class RAGRetriever:
             return False
         return any(k in query.lower() for k in self.vision_keywords)
 
-    def retrieve_text(self, query: str, k: int, metadata: Dict[str, Any] = None):
+    @staticmethod
+    def _build_viking_sql_filter(viking_scope):
+        """Build SQL LIKE clause from Viking scope path patterns."""
+        if not viking_scope or not viking_scope.path_patterns:
+            return "", []
+        like_clauses = ["metadata->>'source_file' LIKE %s"
+                        for _ in viking_scope.path_patterns]
+        path_filter = f" AND ({' OR '.join(like_clauses)})"
+        return path_filter, list(viking_scope.path_patterns)
+
+    def _viking_bm25_filter(self, bm25_results, viking_scope):
+        """Filter BM25 results to only include docs matching Viking scope patterns.
+
+        Runs a single SQL query to validate which doc_ids have source_file
+        matching the Viking path patterns, then keeps only those.
+        """
+        if not viking_scope or not viking_scope.path_patterns or not bm25_results:
+            return bm25_results
+
+        doc_ids = [doc_id for doc_id, _ in bm25_results]
+        id_placeholders = ",".join(["%s"] * len(doc_ids))
+        like_clauses = ["metadata->>'source_file' LIKE %s"
+                        for _ in viking_scope.path_patterns]
+        path_where = " OR ".join(like_clauses)
+
+        sql = f"""
+            SELECT id FROM {self.table_name}
+            WHERE id IN ({id_placeholders}) AND ({path_where})
+        """
+        params = doc_ids + list(viking_scope.path_patterns)
+
+        valid_ids = set()
+        with self.conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+            for row in cur.fetchall():
+                valid_ids.add(row[0])
+
+        filtered = [(doc_id, score) for doc_id, score in bm25_results
+                     if doc_id in valid_ids]
+        if len(filtered) < len(bm25_results):
+            print(f"Viking BM25 Filter: {len(bm25_results)} → {len(filtered)}")
+        return filtered
+
+    @staticmethod
+    def _viking_scope_guard(docs, viking_scope, mode="soft"):
+        """Post-fusion scope guard: enforce Viking path constraints on merged docs.
+
+        strict: hard-drop all out-of-scope docs.
+        soft: keep out-of-scope only when fewer than 3 in-scope docs remain.
+        """
+        if not viking_scope or not viking_scope.path_patterns:
+            return docs
+
+        import fnmatch
+
+        def _matches_scope(doc):
+            src = doc.metadata.get("source_file", "")
+            for pattern in viking_scope.path_patterns:
+                glob_pat = pattern.replace("%", "*")
+                if fnmatch.fnmatch(src, glob_pat):
+                    return True
+            return False
+
+        in_scope = [d for d in docs if _matches_scope(d)]
+        out_scope = [d for d in docs if not _matches_scope(d)]
+
+        if mode == "strict":
+            if len(in_scope) < len(docs):
+                print(f"Viking Scope Guard (strict): {len(docs)} → {len(in_scope)}")
+            return in_scope
+
+        # soft: allow out-of-scope when in-scope count is too low
+        if len(in_scope) >= 3:
+            if out_scope:
+                print(f"Viking Scope Guard (soft): dropped {len(out_scope)} out-of-scope")
+            return in_scope
+
+        print(f"Viking Scope Guard (soft): kept {len(out_scope)} out-of-scope "
+              f"(only {len(in_scope)} in-scope)")
+        return in_scope + out_scope
+
+    def retrieve_text(self, query: str, k: int, metadata: Dict[str, Any] = None,
+                      viking_scope=None):
         print(f"Loading Embeddings ({self.embedding_model_name})...")
         embeddings = HuggingFaceEmbeddings(
             model_name=self.embedding_model_name,
@@ -261,36 +350,75 @@ class RAGRetriever:
                 lang_filter = " AND metadata->>'lang' = %s"
                 lang_param = [lang]
         
-        # 1. Vector Search
-        vector_sql = f"""
-            SELECT id, content, metadata, (embedding <=> %s::vector) as distance
-            FROM {self.table_name}
-            WHERE (embedding <=> %s::vector) < %s {lang_filter}
-            ORDER BY distance ASC LIMIT %s
-        """
-        vector_params = [query_vector, query_vector, threshold_dist] + lang_param + [fetch_k]
+        # 1. Vector Search (with optional Viking scope filter)
+        viking_filter, viking_params = self._build_viking_sql_filter(viking_scope)
+        if viking_filter:
+            print(f"Viking Filter: {len(viking_scope.path_patterns)} path patterns")
+
+        min_viking_hits = self.viking_min_hits
+        viking_attempts = 0
+        fallback_level = 0  # 0=initial, 1=category, 2=lang_only, 3=unrestricted
+
+        while True:
+            vector_sql = f"""
+                SELECT id, content, metadata, (embedding <=> %s::vector) as distance
+                FROM {self.table_name}
+                WHERE (embedding <=> %s::vector) < %s {lang_filter} {viking_filter}
+                ORDER BY distance ASC LIMIT %s
+            """
+            vector_params = ([query_vector, query_vector, threshold_dist]
+                             + lang_param + viking_params + [fetch_k])
+
+            vector_results = []  # [(id, distance)]
+            doc_cache = {}       # id -> (content, metadata)
+            vector_ranks = {}    # id -> rank (for preserving top vector results)
+
+            with self.conn.cursor() as cur:
+                cur.execute(vector_sql, tuple(vector_params))
+                for rank, row in enumerate(cur.fetchall()):
+                    doc_id, content, meta, dist = row
+                    vector_results.append((doc_id, 1 - dist))  # Convert to similarity
+                    doc_cache[doc_id] = (content, meta)
+                    vector_ranks[doc_id] = rank  # Track original vector rank
+
+            print(f"Vector Search: {len(vector_results)} matches")
+
+            # Viking soft fallback: widen scope if too few results
+            if (viking_scope and viking_scope.path_patterns
+                    and len(vector_results) < min_viking_hits
+                    and self.viking_mode == "soft"
+                    and viking_attempts < self.viking_max_expansions):
+                from src.retrieve.viking_router import widen_scope
+                from src.retrieve.viking_index import get_taxonomy_index
+                tax_index = get_taxonomy_index(self.config["project"]["data_path"])
+                prev_trace = viking_scope.trace[-1] if viking_scope.trace else "?"
+                viking_scope = widen_scope(viking_scope, tax_index)
+                viking_filter, viking_params = self._build_viking_sql_filter(viking_scope)
+                viking_attempts += 1
+                fallback_level += 1
+                print(f"Viking Soft Fallback (attempt {viking_attempts}/{self.viking_max_expansions}): "
+                      f"trigger=vector_hits({len(vector_results)})<min_hits({min_viking_hits}), "
+                      f"level={fallback_level}, "
+                      f"step=[{viking_scope.trace[-1] if viking_scope.trace else '?'}], "
+                      f"patterns={len(viking_scope.path_patterns)}, "
+                      f"min_hits={min_viking_hits}, "
+                      f"max_expansions={self.viking_max_expansions}")
+                continue
+
+            break  # Enough results or no more fallback
         
-        vector_results = []  # [(id, distance)]
-        doc_cache = {}       # id -> (content, metadata)
-        vector_ranks = {}    # id -> rank (for preserving top vector results)
-        
-        with self.conn.cursor() as cur:
-            cur.execute(vector_sql, tuple(vector_params))
-            for rank, row in enumerate(cur.fetchall()):
-                doc_id, content, meta, dist = row
-                vector_results.append((doc_id, 1 - dist))  # Convert to similarity
-                doc_cache[doc_id] = (content, meta)
-                vector_ranks[doc_id] = rank  # Track original vector rank
-        
-        print(f"Vector Search: {len(vector_results)} matches")
-        
-        # 2. BM25 Search (if enabled)
+        # 2. BM25 Search (if enabled) with Viking scope parity
         bm25_results = []
         if self.hybrid_enabled:
             try:
                 bm25_index = BM25Index(self.bm25_index_path)
                 bm25_results = bm25_index.search(query, top_k=fetch_k)
                 print(f"BM25 Search: {len(bm25_results)} matches")
+                # In strict mode, pre-filter BM25 to enforce scope purity.
+                # In soft mode, skip pre-filter — let RRF merge freely;
+                # post-fusion _viking_scope_guard handles soft enforcement.
+                if self.viking_mode == "strict":
+                    bm25_results = self._viking_bm25_filter(bm25_results, viking_scope)
             except Exception as e:
                 print(f"BM25 search failed: {e}")
         
@@ -346,8 +474,13 @@ class RAGRetriever:
                 doc.metadata['_vector_rank'] = rank  # Preserve vector rank
                 text_docs.append(doc)
             
-            print(f"Vector Search: {len(text_docs)} results (hybrid disabled)")
+            hybrid_note = ("BM25 filtered to 0 by Viking strict"
+                          if self.hybrid_enabled else "hybrid disabled")
+            print(f"Vector Search: {len(text_docs)} results ({hybrid_note})")
         
+        # Post-fusion Viking scope guard
+        text_docs = self._viking_scope_guard(text_docs, viking_scope, self.viking_mode)
+
         return self._recursive_expand(text_docs)
 
     def _recursive_expand(self, docs: List[Document]) -> List[Document]:
@@ -579,9 +712,35 @@ class RAGRetriever:
         else:
             metadata = {}
 
+        # Viking routing (search-space restriction)
+        viking_scope = None
+        if self.viking_enabled:
+            from src.retrieve.viking_router import compute_scope
+            from src.retrieve.viking_index import get_taxonomy_index
+            data_path = self.config["project"]["data_path"]
+            tax_index = get_taxonomy_index(data_path)
+            viking_scope = compute_scope(query, metadata, tax_index)
+            print(f"Viking Scope: conf={viking_scope.confidence}, "
+                  f"patterns={len(viking_scope.path_patterns)}, "
+                  f"trace={viking_scope.trace}")
+
         # 1. Text Retrieval (Sequential)
-        text_docs = self.retrieve_text(query, k, metadata=metadata)
+        text_docs = self.retrieve_text(query, k, metadata=metadata,
+                                       viking_scope=viking_scope)
         print(f"Text Matches: {len(text_docs)}")
+
+        # Stamp Viking scope metadata on every doc for UI transparency
+        if viking_scope:
+            scope_meta = {
+                "languages": viking_scope.languages,
+                "categories": viking_scope.categories,
+                "phenomena": viking_scope.phenomena,
+                "confidence": viking_scope.confidence,
+                "trace": viking_scope.trace,
+                "patterns": len(viking_scope.path_patterns),
+            }
+            for doc in text_docs:
+                doc.metadata["_viking_scope"] = scope_meta
 
         # 2. Vision Retrieval (Sequential)
         vision_docs = []
