@@ -203,7 +203,11 @@ def run_condition(
 
     # Cleanup retriever to free VRAM/connections
     try:
-        retriever.conn.close()
+        close_method = getattr(retriever, "close", None)
+        if callable(close_method):
+            close_method()
+        elif getattr(retriever, "conn", None) is not None:
+            retriever.conn.close()
     except Exception:
         pass
     del retriever

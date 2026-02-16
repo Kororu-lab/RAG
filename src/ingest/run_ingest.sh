@@ -14,6 +14,19 @@ if [ ! -f "config.yaml" ]; then
     exit 1
 fi
 
+FINALIZE_MODE=${FINALIZE_MODE:-upsert}
+FINALIZE_DRY_RUN=${FINALIZE_DRY_RUN:-0}
+
+if [[ "$FINALIZE_MODE" != "upsert" && "$FINALIZE_MODE" != "rebuild" ]]; then
+    echo "Error: FINALIZE_MODE must be one of {upsert,rebuild}. Got: $FINALIZE_MODE"
+    exit 1
+fi
+
+if [[ "$FINALIZE_DRY_RUN" != "0" && "$FINALIZE_DRY_RUN" != "1" ]]; then
+    echo "Error: FINALIZE_DRY_RUN must be one of {0,1}. Got: $FINALIZE_DRY_RUN"
+    exit 1
+fi
+
 # 1. Vision Capture (HTML -> Images)
 echo -e "\n[Step 1] Capturing Visual Elements (Async Playwright)..."
 uv run src/ingest/vision/vision_ingest.py
@@ -51,7 +64,11 @@ fi
 
 # 3c. Final Ingestion (Jsonl -> Postgres)
 echo -e "  [3c] Finalizing Ingestion to Postgres..."
-uv run src/ingest/raptor/raptor_finalize.py
+finalize_cmd=(uv run src/ingest/raptor/raptor_finalize.py --mode "$FINALIZE_MODE")
+if [ "$FINALIZE_DRY_RUN" = "1" ]; then
+    finalize_cmd+=(--dry-run)
+fi
+"${finalize_cmd[@]}"
 if [ $? -ne 0 ]; then
     echo "Final Ingestion Failed!"
     exit 1

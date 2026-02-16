@@ -70,6 +70,50 @@ Domain (Return ONLY the category name):"""
     return "General"
 
 
+def parse_detected_languages(result: str, known_languages: List[str]) -> Any:
+    """Parse LLM language output into None/str/list with exact+fuzzy matching."""
+    known_languages_lookup = {lang.lower(): lang for lang in known_languages}
+    normalized = (result or "").strip()
+    if normalized.lower() in {"", "none", "null"}:
+        return None
+
+    detected_langs = []
+    candidates = [candidate.strip() for candidate in normalized.split(",")]
+    for candidate in candidates:
+        if not candidate:
+            continue
+
+        exact_match = None
+        if candidate in known_languages:
+            exact_match = candidate
+        else:
+            exact_match = known_languages_lookup.get(candidate.lower())
+
+        if exact_match:
+            detected_langs.append(exact_match)
+            continue
+
+        matches = difflib.get_close_matches(
+            candidate.lower(),
+            list(known_languages_lookup.keys()),
+            n=1,
+            cutoff=0.6,
+        )
+        if matches:
+            mapped = known_languages_lookup[matches[0]]
+            print(f"Mapped '{candidate}' to known language '{mapped}'")
+            detected_langs.append(mapped)
+
+    detected_langs = list(dict.fromkeys(detected_langs))
+    if len(detected_langs) == 1:
+        return detected_langs[0]
+    if 2 <= len(detected_langs) <= 3:
+        return detected_langs
+    if len(detected_langs) > 3:
+        print(f"Multi-language query: {len(detected_langs)} languages, disabling filter")
+    return None
+
+
 def extract_query_metadata(query: str, config: Dict[str, Any]) -> Dict[str, Any]:
     """
     Extracts metadata (Language, Topic) from the user query.
@@ -89,7 +133,6 @@ def extract_query_metadata(query: str, config: Dict[str, Any]) -> Dict[str, Any]
     known_languages = []
     if os.path.exists(doc_dir):
         known_languages = [d for d in os.listdir(doc_dir) if os.path.isdir(os.path.join(doc_dir, d))]
-    known_languages_lookup = {lang.lower(): lang for lang in known_languages}
 
     # [COMMENTED OUT] Fast Path - kept for future optimization if LLM latency becomes an issue
     # detected_langs = []
@@ -122,46 +165,10 @@ Language Name (English only, no punctuation):"""
         chain = lang_prompt | llm | StrOutputParser()
         result = (chain.invoke({"query": query}) or "").strip()
         print(f"LLM Detected Language: {result}")
-
-        detected_langs = []
-        if result.lower() not in {"", "none", "null"}:
-            # Comma-first parsing preserves multi-word language names.
-            candidates = [candidate.strip() for candidate in result.split(",")]
-            for candidate in candidates:
-                if not candidate:
-                    continue
-
-                exact_match = None
-                if candidate in known_languages:
-                    exact_match = candidate
-                else:
-                    exact_match = known_languages_lookup.get(candidate.lower())
-
-                if exact_match:
-                    detected_langs.append(exact_match)
-                    continue
-
-                matches = difflib.get_close_matches(
-                    candidate.lower(),
-                    list(known_languages_lookup.keys()),
-                    n=1,
-                    cutoff=0.6,
-                )
-                if matches:
-                    mapped = known_languages_lookup[matches[0]]
-                    print(f"Mapped '{candidate}' to known language '{mapped}'")
-                    detected_langs.append(mapped)
-
-        # Deduplicate while preserving order.
-        detected_langs = list(dict.fromkeys(detected_langs))
-        if len(detected_langs) == 1:
-            metadata['lang'] = detected_langs[0]
-        elif 2 <= len(detected_langs) <= 3:
-            print(f"Multi-language query detected: {detected_langs}")
-            metadata['lang'] = detected_langs
-        elif len(detected_langs) > 3:
-            print(f"Multi-language query: {len(detected_langs)} languages, disabling filter")
-            metadata['lang'] = None
+        parsed_lang = parse_detected_languages(result, known_languages)
+        if isinstance(parsed_lang, list):
+            print(f"Multi-language query detected: {parsed_lang}")
+        metadata['lang'] = parsed_lang
 
     except Exception as e:
         print(f"Metadata extraction failed: {e}")
