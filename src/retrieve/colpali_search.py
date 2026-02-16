@@ -3,6 +3,7 @@ import json
 import torch
 from typing import List, Dict
 from colpali_engine.models import ColPali, ColPaliProcessor
+from src.utils import load_config, resolve_torch_device
 
 COLPALI_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "../../data/ltdb_colpali")
 EMBEDDINGS_FILE = os.path.join(COLPALI_OUTPUT_DIR, "embeddings.pt")
@@ -30,26 +31,9 @@ class ColPaliRetriever:
              return
 
         print("Loading ColPali Model...")
-        # Load Config for Device
-        import yaml
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        config_path = os.path.join(script_dir, "..", "..", "config.yaml")
-        with open(config_path, "r") as f:
-             config = yaml.safe_load(f)
-        
+        config = load_config()
         configured_device = config.get("embedding", {}).get("device", "auto")
-        device = "cpu"
-        if configured_device == "mps":
-            if torch.backends.mps.is_available():
-                device = "mps"
-        elif configured_device == "cuda":
-             if torch.cuda.is_available():
-                 device = "cuda"
-        else:
-             if torch.cuda.is_available():
-                 device = "cuda"
-             elif torch.backends.mps.is_available():
-                 device = "mps"
+        device = resolve_torch_device(configured_device)
         
         # MPS: Use float16 for best performance and memory usage
         if device == "cuda":

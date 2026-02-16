@@ -3,6 +3,82 @@ import json
 import os
 import yaml
 
+
+def _safe_import_torch():
+    try:
+        import torch  # type: ignore
+
+        return torch
+    except Exception:
+        return None
+
+
+def resolve_torch_device(configured_device: str | None = "auto") -> str:
+    requested = (configured_device or "auto").lower()
+    torch = _safe_import_torch()
+
+    cuda_available = False
+    mps_available = False
+
+    if torch is not None:
+        try:
+            cuda_available = bool(torch.cuda.is_available())
+        except Exception:
+            cuda_available = False
+
+        try:
+            mps_backend = getattr(torch.backends, "mps", None)
+            if mps_backend is not None:
+                mps_available = bool(mps_backend.is_available())
+        except Exception:
+            mps_available = False
+
+    if requested == "cuda":
+        if cuda_available:
+            return "cuda"
+        if mps_available:
+            return "mps"
+        return "cpu"
+
+    if requested == "mps":
+        if mps_available:
+            return "mps"
+        if cuda_available:
+            return "cuda"
+        return "cpu"
+
+    if requested == "cpu":
+        return "cpu"
+
+    if cuda_available:
+        return "cuda"
+    if mps_available:
+        return "mps"
+    return "cpu"
+
+
+def clear_torch_cache() -> None:
+    torch = _safe_import_torch()
+    if torch is None:
+        return
+
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            return
+    except Exception:
+        pass
+
+    try:
+        mps_backend = getattr(torch.backends, "mps", None)
+        mps_module = getattr(torch, "mps", None)
+        if mps_backend is not None and mps_backend.is_available():
+            if mps_module is not None and hasattr(mps_module, "empty_cache"):
+                mps_module.empty_cache()
+    except Exception:
+        pass
+
+
 def load_config():
     """
     Loads configuration from config.yaml by searching up from the current script.

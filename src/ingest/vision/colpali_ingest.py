@@ -1,6 +1,5 @@
 import os
 import json
-import yaml
 import torch
 from PIL import Image
 from tqdm import tqdm
@@ -13,7 +12,7 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from src.utils import load_config
+from src.utils import load_config, resolve_torch_device
 
 VISION_DIR = os.path.join(os.path.dirname(__file__), "../../../data/ltdb_vision")
 METADATA_FILE = os.path.join(VISION_DIR, "metadata.jsonl") 
@@ -42,19 +41,7 @@ def load_metadata(path: str) -> List[Dict]:
 def main():
     config = load_config()
     configured_device = config.get("embedding", {}).get("device", "auto")
-    
-    device = "cpu"
-    if configured_device == "mps":
-        if torch.backends.mps.is_available():
-            device = "mps"
-    elif configured_device == "cuda":
-        if torch.cuda.is_available():
-            device = "cuda"
-    else: # auto
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif torch.backends.mps.is_available():
-            device = "mps"
+    device = resolve_torch_device(configured_device)
 
     print(f"Using device: {device}")
     

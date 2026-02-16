@@ -38,7 +38,7 @@ llm_retrieval:
 
 embedding:
   model_name: "BAAI/bge-m3"
-  device: "cuda" # or "cpu" if cuda is not available
+  device: "auto" # auto prefers cuda, then mps, then cpu; explicit values: cuda/mps/cpu with fallback
   normalize_embeddings: true
 
 retrieval:
@@ -63,15 +63,6 @@ reranker:
   enabled: true
   model_name: "BAAI/bge-reranker-v2-m3"
   top_n: 5
-
-rag:
-  enable_graph: false
-
-neo4j:
-  uri: "bolt://localhost:7687"
-  username: "neo4j"
-  password: "password" # Change this to your Neo4j password
-
 
 database:
   type: "postgres"

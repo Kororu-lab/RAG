@@ -20,7 +20,6 @@ dependencies = [
     "langgraph>=1.0.5",
     "lxml>=6.0.2",
     "markdownify>=1.2.2",
-    "neo4j>=6.0.3",
     "pgvector>=0.3.6",
     "pillow>=12.1.0",
     "playwright>=1.57.0",

@@ -10,7 +10,6 @@ import json
 import argparse
 import psycopg2
 import time
-import torch
 from typing import List, Dict, Any
 from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -166,7 +165,7 @@ Domain (Return ONLY the category name):"""
     except Exception:
         pass 
         
-    torch.cuda.empty_cache()
+    src.utils.clear_torch_cache()
     import gc
     gc.collect()
     time.sleep(1) 
@@ -180,7 +179,10 @@ class RAGRetriever:
         self.db_cfg = self.config.get("database", {})
         
         self.embedding_model_name = self.config["embedding"]["model_name"]
-        self.device = self.config["embedding"]["device"]
+        configured_device = self.config.get("embedding", {}).get("device", "auto")
+        self.device = src.utils.resolve_torch_device(configured_device)
+        if (configured_device or "auto").lower() != self.device:
+            print(f"Device fallback: embedding.device='{configured_device}' -> '{self.device}'")
         
         self.reranker_model_name = self.config["reranker"]["model_name"]
         self.use_reranker = self.config["reranker"]["enabled"]
@@ -223,11 +225,10 @@ class RAGRetriever:
         self.vision_keywords = ["도표", "table", "chart", "structure", "구조", "IPA", "paradigm", "gloss", "마커", "marker", "예시", "box", "박스"]
 
     def _clean_memory(self):
-        """Force garbage collection and CUDA cache clearing."""
+        """Force garbage collection and torch cache clearing."""
         import gc
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        src.utils.clear_torch_cache()
 
     def _is_visual_query(self, query: str) -> bool:
         if not ColPaliRetriever or not self.vision_enabled:

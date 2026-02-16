@@ -9,7 +9,7 @@ from psycopg2.extras import Json
 # Ensure src is resolvable
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
 
-from src.utils import load_config, LLMUtility 
+from src.utils import load_config, LLMUtility, resolve_torch_device, clear_torch_cache
 
 def get_db_connection(config: Dict):
     """Establishes connection to PostgreSQL."""
@@ -72,6 +72,8 @@ def main():
     
     config = load_config()
     db_table = config['database']['table_name']
+    configured_device = config.get("embedding", {}).get("device", "auto")
+    device = resolve_torch_device(configured_device)
     
     # Unload Ollama to free VRAM
     print("Unloading any resident Ollama models to free VRAM...")
@@ -81,22 +83,22 @@ def main():
         model_name = llm_cfg.get('model_name')
         if model_name:
             LLMUtility.unload_model("ingestion")
+        clear_torch_cache()
         import torch
-        
-        # Clear Cache based on Config Device or Availability
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+
+        if device == "cuda" and torch.cuda.is_available():
             print(f"Cleared CUDA Cache. Free memory: {torch.cuda.mem_get_info()[0] / 1024**3:.2f} GB")
-        elif torch.backends.mps.is_available():
-            torch.mps.empty_cache()
+        elif device == "mps":
             print("Cleared MPS Cache.")
             
     except Exception as e:
         print(f"Warning: Could not unload model: {e}")
 
     # Initialize Embeddings
-    device = config['embedding']['device']
-    print(f"Initializing Embeddings (BAAI/bge-m3) on device: {device}...")
+    print(
+        f"Initializing Embeddings (BAAI/bge-m3) on device: {device} "
+        f"(configured: {configured_device} -> resolved: {device})..."
+    )
     embeddings = HuggingFaceEmbeddings(
         model_name=config['embedding']['model_name'],
         model_kwargs={'device': device},
