@@ -1,30 +1,51 @@
 import os
 import sys
-import subprocess
 import logging
 
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from src.agent.service import run_query
 
 # Configure Logging
 logging.basicConfig(level=logging.WARNING)
 
 
 def run_vector_pipeline(query, interactive=False):
-    """Executes the standard Vector RAG pipeline (Process Isolation)."""
-    print("\n[Pipeline] Running VECTOR RAG pipeline...")
-    
-    # Stage 1: Retrieval
-    print("[Stage 1] Retrieving Context...")
-    ret_code = subprocess.call(["uv", "run", "src/retrieve/rag_retrieve.py", query])
-    
-    if ret_code != 0:
-        print("Retrieval failed.")
-        return
+    """Executes the unified graph service pipeline."""
+    print("\n[Pipeline] Running GRAPH RAG pipeline...")
+    results = run_query(query, search_count=0)
 
-    # Stage 2: Generation
-    print("[Stage 2] Generating Answer...")
-    subprocess.call(["uv", "run", "src/llm/rag_generate.py"])
+    final_payload = results.get("check_hallucination") or results.get("generate") or {}
+    generation = final_payload.get("generation")
+
+    if generation:
+        print("\n[Final Answer]")
+        print(generation)
+    else:
+        print("No answer generated.")
+
+    documents = final_payload.get("documents")
+    if not documents:
+        documents = (results.get("generate") or {}).get("documents", [])
+
+    if documents:
+        print("\n[References]")
+        unique_refs = []
+        seen_refs = set()
+        for doc in documents:
+            ref_id = doc.metadata.get("ref_id", "Unknown")
+            if ref_id in seen_refs:
+                continue
+            level = doc.metadata.get("level", "0")
+            prefix = "Summary" if str(level) == "1" else "Detail"
+            seen_refs.add(ref_id)
+            unique_refs.append((prefix, ref_id))
+
+        for prefix, ref_id in unique_refs[:10]:
+            print(f"- [{prefix}] {ref_id}")
+        if len(unique_refs) > 10:
+            print(f"- ... and {len(unique_refs) - 10} more")
 
 def main():
     print("==================================================")

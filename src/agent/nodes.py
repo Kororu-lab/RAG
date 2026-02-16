@@ -129,13 +129,12 @@ def retrieve_node(state: GraphState):
         print(f"  - Dynamic Scaling: Normal query. k={k}, top_n={top_n}")
 
 
-    retriever = RAGRetriever()
-    
-    # Metadata Extraction Logic (New)
-    print("  - Analyzing Query Metadata...")
-    metadata = extract_query_metadata(question, retriever.config)
-    
-    new_docs = retriever.retrieve_documents(question, k=k, top_n=top_n, metadata=metadata)
+    with RAGRetriever() as retriever:
+        # Metadata Extraction Logic (New)
+        print("  - Analyzing Query Metadata...")
+        metadata = extract_query_metadata(question, retriever.config)
+
+        new_docs = retriever.retrieve_documents(question, k=k, top_n=top_n, metadata=metadata)
     
     # Merge and deduplicate
     combined_docs = []

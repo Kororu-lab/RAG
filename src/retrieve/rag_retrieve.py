@@ -38,6 +38,38 @@ except ImportError as e:
 
 
 
+def detect_topic_with_llm(query: str, llm) -> str:
+    """Detect linguistic domain with a safe default."""
+    valid_topics = ["Phonology", "Grammar", "Lexicon", "General"]
+    if llm is None:
+        return "General"
+
+    topic_prompt = ChatPromptTemplate.from_template(
+        """Analyze the user's query and classify it into one of the following Linguistic Domains:
+- Phonology (Sounds, Tones, IPA, Phonemes)
+- Grammar (Syntax, Morphology, Sentence Structure)
+- Lexicon (Words, Vocabulary, Dictionary)
+- General (History, Demographics, Metadata, Others)
+
+Query: {query}
+Domain (Return ONLY the category name):"""
+    )
+
+    try:
+        chain_topic = topic_prompt | llm | StrOutputParser()
+        topic_result = (chain_topic.invoke({"query": query}) or "").strip()
+    except Exception as e:
+        print(f"Topic detection failed: {e}")
+        return "General"
+
+    topic_result_lower = topic_result.lower()
+    for topic in valid_topics:
+        if topic.lower() in topic_result_lower:
+            return topic
+
+    return "General"
+
+
 def extract_query_metadata(query: str, config: Dict[str, Any]) -> Dict[str, Any]:
     """
     Extracts metadata (Language, Topic) from the user query.
@@ -47,7 +79,7 @@ def extract_query_metadata(query: str, config: Dict[str, Any]) -> Dict[str, Any]
     Returns: {'lang': str|None, 'topic': str|None}
     """
     metadata = {'lang': None, 'topic': None}
-    
+
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     # Language Detection
@@ -57,13 +89,12 @@ def extract_query_metadata(query: str, config: Dict[str, Any]) -> Dict[str, Any]
     known_languages = []
     if os.path.exists(doc_dir):
         known_languages = [d for d in os.listdir(doc_dir) if os.path.isdir(os.path.join(doc_dir, d))]
-        
-    query_lower = query.lower()
-    
+    known_languages_lookup = {lang.lower(): lang for lang in known_languages}
+
     # [COMMENTED OUT] Fast Path - kept for future optimization if LLM latency becomes an issue
     # detected_langs = []
     # for lang in known_languages:
-    #     if lang in query_lower:
+    #     if lang in query.lower():
     #         detected_langs.append(lang)
     # if detected_langs:
     #     metadata['lang'] = detected_langs if len(detected_langs) > 1 else detected_langs[0]
@@ -71,11 +102,10 @@ def extract_query_metadata(query: str, config: Dict[str, Any]) -> Dict[str, Any]
     # LLM-based language detection (handles Korean, Chinese, English names)
     llm = None
     print("Using LLM for language detection...")
-    llm_name = config.get("llm_retrieval", config.get("llm", {})).get("model_name")
-    
+
     try:
         llm = get_llm("retrieval")
-        
+
         lang_prompt = ChatPromptTemplate.from_template(
             """Analyze the user's query and identify if a specific language is being asked about.
 If found, translate it to its standard English Academic name.
@@ -88,88 +118,73 @@ If no specific language is targeted, return "None".
 Query: {query}
 Language Name (English only, no punctuation):"""
         )
-        
-        chain = lang_prompt | llm | StrOutputParser()
-        result = chain.invoke({"query": query}).strip()
-        print(f"LLM Detected Language: {result}")
-        
-        if result and result != "None":
-            # Parse multi-language output (e.g., "Takpa Achang" or "Takpa, Achang")
-            import re
-            lang_tokens = re.split(r'[,\s]+', result.lower())
-            detected_langs = []
-            
-            for token in lang_tokens:
-                token = token.strip()
-                if not token:
-                    continue
-                if token in known_languages:
-                    detected_langs.append(token)
-                else:
-                    matches = difflib.get_close_matches(token, known_languages, n=1, cutoff=0.6)
-                    if matches:
-                        print(f"Mapped '{token}' to known language '{matches[0]}'")
-                        detected_langs.append(matches[0])
-            
-            # Deduplicate and set metadata
-            detected_langs = list(dict.fromkeys(detected_langs))  # Preserve order, remove dups
-            if len(detected_langs) > 3:
-                print(f"Multi-language query: {len(detected_langs)} languages, disabling filter")
-                metadata['lang'] = None
-            elif len(detected_langs) > 1:
-                print(f"Multi-language query detected: {detected_langs}")
-                metadata['lang'] = detected_langs
-            elif len(detected_langs) == 1:
-                metadata['lang'] = detected_langs[0]
-            
-            # Topic fallback if language not detected
-            if not metadata['lang']:
-                print("Language not detected. Triggering Topic Fallback...")
-                
-                topic_prompt = ChatPromptTemplate.from_template(
-                    """Analyze the user's query and classify it into one of the following Linguistic Domains:
-- Phonology (Sounds, Tones, IPA, Phonemes)
-- Grammar (Syntax, Morphology, Sentence Structure)
-- Lexicon (Words, Vocabulary, Dictionary)
-- General (History, Demographics, Metadata, Others)
 
-Query: {query}
-Domain (Return ONLY the category name):"""
-                )
-                
-                chain_topic = topic_prompt | llm | StrOutputParser()
-                topic_result = chain_topic.invoke({"query": query}).strip()
-                
-                # Basic validation
-                valid_topics = ["Phonology", "Grammar", "Lexicon", "General"]
-                if any(t in topic_result for t in valid_topics):
-                     # Clean up partial matches
-                     for t in valid_topics:
-                         if t in topic_result:
-                             metadata['topic'] = t
-                             break
+        chain = lang_prompt | llm | StrOutputParser()
+        result = (chain.invoke({"query": query}) or "").strip()
+        print(f"LLM Detected Language: {result}")
+
+        detected_langs = []
+        if result.lower() not in {"", "none", "null"}:
+            # Comma-first parsing preserves multi-word language names.
+            candidates = [candidate.strip() for candidate in result.split(",")]
+            for candidate in candidates:
+                if not candidate:
+                    continue
+
+                exact_match = None
+                if candidate in known_languages:
+                    exact_match = candidate
                 else:
-                    metadata['topic'] = "General"
-                    
-                print(f"LLM Detected Topic: {metadata['topic']}")
-                
+                    exact_match = known_languages_lookup.get(candidate.lower())
+
+                if exact_match:
+                    detected_langs.append(exact_match)
+                    continue
+
+                matches = difflib.get_close_matches(
+                    candidate.lower(),
+                    list(known_languages_lookup.keys()),
+                    n=1,
+                    cutoff=0.6,
+                )
+                if matches:
+                    mapped = known_languages_lookup[matches[0]]
+                    print(f"Mapped '{candidate}' to known language '{mapped}'")
+                    detected_langs.append(mapped)
+
+        # Deduplicate while preserving order.
+        detected_langs = list(dict.fromkeys(detected_langs))
+        if len(detected_langs) == 1:
+            metadata['lang'] = detected_langs[0]
+        elif 2 <= len(detected_langs) <= 3:
+            print(f"Multi-language query detected: {detected_langs}")
+            metadata['lang'] = detected_langs
+        elif len(detected_langs) > 3:
+            print(f"Multi-language query: {len(detected_langs)} languages, disabling filter")
+            metadata['lang'] = None
+
     except Exception as e:
         print(f"Metadata extraction failed: {e}")
 
+    if not metadata['lang']:
+        print("Language not detected. Triggering Topic Fallback...")
+        metadata['topic'] = detect_topic_with_llm(query, llm)
+        print(f"LLM Detected Topic: {metadata['topic']}")
+
     # Cleanup
     print("Ensuring VRAM is clean (Unloading Ollama)...")
-    if llm: 
+    if llm:
         del llm
     try:
         LLMUtility.unload_model("retrieval")
     except Exception:
-        pass 
-        
+        pass
+
     src.utils.clear_torch_cache()
     import gc
     gc.collect()
-    time.sleep(1) 
-    
+    time.sleep(1)
+
     return metadata
 
 
@@ -223,6 +238,26 @@ class RAGRetriever:
         self.viking_min_hits = viking_cfg.get("min_hits", 3)
         
         self.vision_keywords = ["도표", "table", "chart", "structure", "구조", "IPA", "paradigm", "gloss", "마커", "marker", "예시", "box", "박스"]
+
+    def close(self):
+        """Safely close DB connection."""
+        conn = getattr(self, "conn", None)
+        if conn is None:
+            return
+        try:
+            if not conn.closed:
+                conn.close()
+        except Exception as e:
+            print(f"Error closing database connection: {e}")
+        finally:
+            self.conn = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
 
     def _clean_memory(self):
         """Force garbage collection and torch cache clearing."""
@@ -613,9 +648,9 @@ class RAGRetriever:
         sibling_docs = []
         with self.conn.cursor() as cur:
             for src in sources_with_title_only:
-                cur.execute("""
+                cur.execute(f"""
                     SELECT content, metadata 
-                    FROM linguistics_raptor
+                    FROM {self.table_name}
                     WHERE metadata->>'source_file' = %s
                     AND (metadata->>'chunk_id')::int > 0
                     ORDER BY (metadata->>'chunk_id')::int
@@ -879,5 +914,5 @@ if __name__ == "__main__":
     metadata = extract_query_metadata(args.query, config)
     
     # Initialize RAGRetriever (Loads Embeddings, Reranker, ColPali + Postgres)
-    retriever = RAGRetriever()
-    retriever.retrieve(args.query, metadata=metadata)
+    with RAGRetriever() as retriever:
+        retriever.retrieve(args.query, metadata=metadata)

@@ -12,7 +12,7 @@ project_root = os.path.abspath(os.path.join(current_dir, "../.."))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from src.agent.graph import app
+from src.agent.service import run_query_stream
 from src.ui.model_options import DEFAULT_MODEL, MODEL_OPTIONS
 
 LTDB_ROOT = os.path.abspath(os.path.join(project_root, "data", "ltdb"))
@@ -198,9 +198,7 @@ if prompt := st.chat_input("Enter your query"):
 
             try:
                 sys.stdout = logger
-                inputs = {"question": prompt, "search_count": 0}
-
-                for output in app.stream(inputs):
+                for output in run_query_stream(prompt, search_count=0):
                     for key, value in output.items():
                         if key == "retrieve":
                             n = len(value.get("documents", []))
