@@ -103,6 +103,20 @@ def load_data(file_path: str) -> List[Dict]:
                     continue
     return data
 
+
+def build_upsert_sql(table_name: str):
+    return sql.SQL(
+        """
+        INSERT INTO {} (doc_key, content, embedding, metadata)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (doc_key) DO UPDATE
+        SET content = EXCLUDED.content,
+            embedding = EXCLUDED.embedding,
+            metadata = EXCLUDED.metadata,
+            created_at = NOW()
+        """
+    ).format(sql.Identifier(table_name))
+
 def main():
     parser = argparse.ArgumentParser(description="Finalize RAPTOR ingestion into PostgreSQL.")
     parser.add_argument(
@@ -189,6 +203,8 @@ def main():
     
     print("Starting Ingestion...")
     with conn.cursor() as cur:
+        upsert_sql = build_upsert_sql(db_table)
+
         batch_texts = []
         batch_metas = []
         
@@ -214,18 +230,7 @@ def main():
                 
                 # Psycopg2 execute_values equivalent loop
                 for doc_key_val, content_val, vector_val, meta_val in args_list:
-                    cur.execute(
-                        f"""
-                        INSERT INTO {db_table} (doc_key, content, embedding, metadata)
-                        VALUES (%s, %s, %s, %s)
-                        ON CONFLICT (doc_key) DO UPDATE
-                        SET content = EXCLUDED.content,
-                            embedding = EXCLUDED.embedding,
-                            metadata = EXCLUDED.metadata,
-                            created_at = NOW()
-                        """,
-                        (doc_key_val, content_val, vector_val, meta_val)
-                    )
+                    cur.execute(upsert_sql, (doc_key_val, content_val, vector_val, meta_val))
                 
                 conn.commit()
                 total_embedded += len(batch_texts)
@@ -243,18 +248,7 @@ def main():
                 for j, (text, meta) in enumerate(zip(batch_texts, batch_metas))
             ]
             for doc_key_val, content_val, vector_val, meta_val in args_list:
-                cur.execute(
-                    f"""
-                    INSERT INTO {db_table} (doc_key, content, embedding, metadata)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (doc_key) DO UPDATE
-                    SET content = EXCLUDED.content,
-                        embedding = EXCLUDED.embedding,
-                        metadata = EXCLUDED.metadata,
-                        created_at = NOW()
-                    """,
-                    (doc_key_val, content_val, vector_val, meta_val)
-                )
+                cur.execute(upsert_sql, (doc_key_val, content_val, vector_val, meta_val))
             conn.commit()
             total_embedded += len(batch_texts)
             

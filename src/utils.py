@@ -2,6 +2,22 @@ import requests
 import json
 import os
 import yaml
+from contextlib import contextmanager
+from contextvars import ContextVar
+from copy import deepcopy
+
+
+_CONFIG_OVERRIDE: ContextVar[dict | None] = ContextVar("_CONFIG_OVERRIDE", default=None)
+
+
+@contextmanager
+def use_config_override(cfg: dict | None):
+    """Temporarily override load_config() within the current context."""
+    token = _CONFIG_OVERRIDE.set(deepcopy(cfg) if cfg is not None else None)
+    try:
+        yield
+    finally:
+        _CONFIG_OVERRIDE.reset(token)
 
 
 def _safe_import_torch():
@@ -119,6 +135,10 @@ def load_config():
     """
     Loads configuration from config.yaml by searching up from the current script.
     """
+    override = _CONFIG_OVERRIDE.get()
+    if override is not None:
+        return deepcopy(override)
+
     current_dir = os.path.dirname(os.path.abspath(__file__))
     
     while True:
@@ -167,11 +187,13 @@ class LLMUtility:
                 "keep_alive": 0
             }
             try:
-                response = requests.post(url, json=payload)
+                response = requests.post(url, json=payload, timeout=(2, 5))
                 if response.status_code == 200:
                     print(f"[LLMUtility] Successfully unloaded Ollama model: {model_name}")
                 else:
                     print(f"[LLMUtility] Failed to unload model {model_name}: {response.text}")
+            except requests.Timeout as e:
+                print(f"[LLMUtility] Timeout unloading model {model_name}: {e}")
             except Exception as e:
                 print(f"[LLMUtility] Error unloading model: {e}")
         else:

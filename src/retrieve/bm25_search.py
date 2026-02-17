@@ -5,7 +5,11 @@ import pickle
 import re
 from typing import List, Dict, Tuple, Optional
 
+from psycopg2 import sql
 from rank_bm25 import BM25Okapi
+
+
+MAX_INDEX_FILE_SIZE_BYTES = 512 * 1024 * 1024
 
 
 class BM25Index:
@@ -31,11 +35,14 @@ class BM25Index:
         """Build BM25 index from PostgreSQL original_content."""
         print("  Fetching documents for BM25 indexing...")
         with conn.cursor() as cur:
-            cur.execute(f"""
-                SELECT id, 
+            query_sql = sql.SQL(
+                """
+                SELECT id,
                        COALESCE(metadata->>'original_content', content) as text
-                FROM {table_name}
-            """)
+                FROM {}
+                """
+            ).format(sql.Identifier(table_name))
+            cur.execute(query_sql)
             rows = cur.fetchall()
         
         print(f"  Tokenizing {len(rows)} documents...")
@@ -63,15 +70,87 @@ class BM25Index:
         if not os.path.exists(self.index_path):
             print(f"  BM25 index not found: {self.index_path}")
             return False
+
+        try:
+            file_size = os.path.getsize(self.index_path)
+        except OSError as e:
+            print(f"  BM25 index stat failed: {e}")
+            self._invalidate()
+            return False
+
+        if file_size <= 0:
+            print(f"  BM25 index is empty: {self.index_path}")
+            self._invalidate()
+            return False
+        if file_size > MAX_INDEX_FILE_SIZE_BYTES:
+            print(
+                f"  BM25 index too large ({file_size} bytes > {MAX_INDEX_FILE_SIZE_BYTES}): "
+                f"{self.index_path}"
+            )
+            self._invalidate()
+            return False
         
         print(f"  Loading BM25 index from {self.index_path}...")
-        with open(self.index_path, 'rb') as f:
-            data = pickle.load(f)
-        self.doc_ids = data['doc_ids']
-        self.corpus = data['corpus']
-        self.bm25 = BM25Okapi(self.corpus)
+        try:
+            with open(self.index_path, 'rb') as f:
+                data = pickle.load(f)
+        except Exception as e:
+            print(f"  BM25 index load failed: {e}")
+            self._invalidate()
+            return False
+
+        if not self._validate_payload(data):
+            self._invalidate()
+            return False
+
+        self.doc_ids = data["doc_ids"]
+        self.corpus = data["corpus"]
+        try:
+            self.bm25 = BM25Okapi(self.corpus)
+        except Exception as e:
+            print(f"  BM25 index initialize failed: {e}")
+            self._invalidate()
+            return False
+
         self._loaded = True
         print(f"  BM25 index loaded: {len(self.doc_ids)} docs")
+        return True
+
+    def _invalidate(self):
+        self.doc_ids = []
+        self.corpus = []
+        self.bm25 = None
+        self._loaded = False
+
+    def _validate_payload(self, data) -> bool:
+        if not isinstance(data, dict):
+            print("  Invalid BM25 index payload: expected dict.")
+            return False
+        if "doc_ids" not in data or "corpus" not in data:
+            print("  Invalid BM25 index payload: missing doc_ids/corpus.")
+            return False
+
+        doc_ids = data["doc_ids"]
+        corpus = data["corpus"]
+
+        if not isinstance(doc_ids, list) or not isinstance(corpus, list):
+            print("  Invalid BM25 index payload: doc_ids/corpus must be lists.")
+            return False
+        if len(doc_ids) != len(corpus):
+            print("  Invalid BM25 index payload: doc_ids/corpus length mismatch.")
+            return False
+        if any(type(doc_id) is not int for doc_id in doc_ids):
+            print("  Invalid BM25 index payload: doc_ids must be ints.")
+            return False
+
+        for tokens in corpus:
+            if not isinstance(tokens, list):
+                print("  Invalid BM25 index payload: corpus entries must be token lists.")
+                return False
+            if any(not isinstance(token, str) for token in tokens):
+                print("  Invalid BM25 index payload: tokens must be strings.")
+                return False
+
         return True
     
     def search(self, query: str, top_k: int = 50) -> List[Tuple[int, float]]:

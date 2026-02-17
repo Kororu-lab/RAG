@@ -9,6 +9,7 @@ import yaml
 import json
 import argparse
 import psycopg2
+from psycopg2 import sql
 import time
 from typing import List, Dict, Any
 from langchain_core.documents import Document
@@ -302,15 +303,21 @@ class RAGRetriever:
                         for _ in viking_scope.path_patterns]
         path_where = " OR ".join(like_clauses)
 
-        sql = f"""
-            SELECT id FROM {self.table_name}
-            WHERE id IN ({id_placeholders}) AND ({path_where})
-        """
+        query_sql = sql.SQL(
+            """
+            SELECT id FROM {}
+            WHERE id IN ({}) AND ({})
+            """
+        ).format(
+            sql.Identifier(self.table_name),
+            sql.SQL(id_placeholders),
+            sql.SQL(path_where),
+        )
         params = doc_ids + list(viking_scope.path_patterns)
 
         valid_ids = set()
         with self.conn.cursor() as cur:
-            cur.execute(sql, tuple(params))
+            cur.execute(query_sql, tuple(params))
             for row in cur.fetchall():
                 valid_ids.add(row[0])
 
@@ -403,12 +410,18 @@ class RAGRetriever:
         fallback_level = 0  # 0=initial, 1=category, 2=lang_only, 3=unrestricted
 
         while True:
-            vector_sql = f"""
+            vector_sql = sql.SQL(
+                """
                 SELECT id, content, metadata, (embedding <=> %s::vector) as distance
-                FROM {self.table_name}
-                WHERE (embedding <=> %s::vector) < %s {lang_filter} {viking_filter}
+                FROM {}
+                WHERE (embedding <=> %s::vector) < %s {} {}
                 ORDER BY distance ASC LIMIT %s
-            """
+                """
+            ).format(
+                sql.Identifier(self.table_name),
+                sql.SQL(lang_filter),
+                sql.SQL(viking_filter),
+            )
             vector_params = ([query_vector, query_vector, threshold_dist]
                              + lang_param + viking_params + [fetch_k])
 
@@ -483,10 +496,16 @@ class RAGRetriever:
             if missing_ids:
                 placeholders = ','.join(['%s'] * len(missing_ids))
                 with self.conn.cursor() as cur:
-                    cur.execute(f"""
-                        SELECT id, content, metadata FROM {self.table_name}
-                        WHERE id IN ({placeholders})
-                    """, tuple(missing_ids))
+                    query_sql = sql.SQL(
+                        """
+                        SELECT id, content, metadata FROM {}
+                        WHERE id IN ({})
+                        """
+                    ).format(
+                        sql.Identifier(self.table_name),
+                        sql.SQL(placeholders),
+                    )
+                    cur.execute(query_sql, tuple(missing_ids))
                     for row in cur.fetchall():
                         doc_id, content, meta = row
                         doc_cache[doc_id] = (content, meta)
@@ -588,9 +607,14 @@ class RAGRetriever:
             
             if or_clauses:
                 where_clause = " OR ".join(or_clauses)
-                sql = f"SELECT content, metadata FROM {self.table_name} WHERE ({where_clause})"
+                query_sql = sql.SQL(
+                    "SELECT content, metadata FROM {} WHERE ({})"
+                ).format(
+                    sql.Identifier(self.table_name),
+                    sql.SQL(where_clause),
+                )
                 
-                cur.execute(sql, tuple(params))
+                cur.execute(query_sql, tuple(params))
                 rows = cur.fetchall()
                 
                 for row in rows:
@@ -655,14 +679,17 @@ class RAGRetriever:
         sibling_docs = []
         with self.conn.cursor() as cur:
             for src in sources_with_title_only:
-                cur.execute(f"""
-                    SELECT content, metadata 
-                    FROM {self.table_name}
+                query_sql = sql.SQL(
+                    """
+                    SELECT content, metadata
+                    FROM {}
                     WHERE metadata->>'source_file' = %s
                     AND (metadata->>'chunk_id')::int > 0
                     ORDER BY (metadata->>'chunk_id')::int
                     LIMIT 10
-                """, (src,))
+                    """
+                ).format(sql.Identifier(self.table_name))
+                cur.execute(query_sql, (src,))
                 
                 for row in cur.fetchall():
                     content, meta = row

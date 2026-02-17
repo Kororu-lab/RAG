@@ -105,19 +105,14 @@ with st.sidebar:
 
     st.divider()
     
-    # Config Patching
-    
-    if not hasattr(src.utils, "_original_load_config"):
-        src.utils._original_load_config = src.utils.load_config
+    def build_runtime_config():
+        config = src.utils.load_config()
 
-    def patched_load_config():
-        config = src.utils._original_load_config()
-        
         # Model override
         config.setdefault("llm_retrieval", {})["model_name"] = selected_model
         if "llm" in config:
             config["llm"]["model_name"] = selected_model
-        
+
         # Retrieval settings override
         retrieval = config.setdefault("retrieval", {})
         retrieval.setdefault("hybrid_search", {})["enabled"] = bm25_enabled
@@ -129,17 +124,15 @@ with st.sidebar:
         viking["enabled"] = viking_enabled
         viking["mode"] = "soft" if viking_soft else "strict"
         viking["max_expansions"] = int(viking_max_exp)
-        
+
         # Reranker override
         config.setdefault("reranker", {})["enabled"] = reranker_enabled
         rag = config.setdefault("rag", {})
         rag["generation_timeout_sec"] = int(generation_timeout_sec)
         rag["skip_grading"] = not grading_enabled
         rag["skip_hallucination"] = not hallucination_check_enabled
-        
-        return config
 
-    src.utils.load_config = patched_load_config
+        return config
     
     st.header("Status")
     st.success("System Ready")
@@ -198,90 +191,92 @@ if prompt := st.chat_input("Enter your query"):
 
             try:
                 sys.stdout = logger
-                for output in run_query_stream(prompt, search_count=0):
-                    for key, value in output.items():
-                        if key == "retrieve":
-                            n = len(value.get("documents", []))
-                            viking_tag = ""
-                            if viking_enabled:
-                                viking_tag = " (Viking)"
-                                # Extract scope details from first doc metadata
-                                docs = value.get("documents", [])
-                                scope_info = None
-                                for d in docs:
-                                    scope_info = d.metadata.get("_viking_scope")
+                runtime_cfg = build_runtime_config()
+                with src.utils.use_config_override(runtime_cfg):
+                    for output in run_query_stream(prompt, search_count=0):
+                        for key, value in output.items():
+                            if key == "retrieve":
+                                n = len(value.get("documents", []))
+                                viking_tag = ""
+                                if viking_enabled:
+                                    viking_tag = " (Viking)"
+                                    # Extract scope details from first doc metadata
+                                    docs = value.get("documents", [])
+                                    scope_info = None
+                                    for d in docs:
+                                        scope_info = d.metadata.get("_viking_scope")
+                                        if scope_info:
+                                            break
                                     if scope_info:
-                                        break
-                                if scope_info:
-                                    parts = []
-                                    if scope_info.get("languages"):
-                                        parts.append(f"lang={scope_info['languages']}")
-                                    if scope_info.get("phenomena"):
-                                        parts.append(f"phenomena={scope_info['phenomena']}")
-                                    elif scope_info.get("categories"):
-                                        parts.append(f"categories={scope_info['categories']}")
-                                    parts.append(f"conf={scope_info.get('confidence', '?')}")
-                                    parts.append(f"patterns={scope_info.get('patterns', 0)}")
-                                    viking_tag += f" `[{', '.join(parts)}]`"
-                                    trace = scope_info.get("trace", [])
-                                    if any("widened" in t for t in trace):
-                                        viking_tag += " *(fallback)*"
-                            step_log.append(f"**Retrieve**{viking_tag} — {n} documents")
-                            if viking_enabled and (not viking_soft) and n == 0:
-                                step_log.append(
-                                    "**Viking Strict Warning** — 0 docs in current strict scope. "
-                                    "Try soft mode, increase max expansions, or tune min_hits."
-                                )
-                                if not strict_zero_doc_warned:
-                                    st.warning(
-                                        "Viking strict scope returned 0 documents. "
-                                        "Suggested actions: switch to soft mode, "
-                                        "increase Viking Max Expansions, adjust min_hits."
+                                        parts = []
+                                        if scope_info.get("languages"):
+                                            parts.append(f"lang={scope_info['languages']}")
+                                        if scope_info.get("phenomena"):
+                                            parts.append(f"phenomena={scope_info['phenomena']}")
+                                        elif scope_info.get("categories"):
+                                            parts.append(f"categories={scope_info['categories']}")
+                                        parts.append(f"conf={scope_info.get('confidence', '?')}")
+                                        parts.append(f"patterns={scope_info.get('patterns', 0)}")
+                                        viking_tag += f" `[{', '.join(parts)}]`"
+                                        trace = scope_info.get("trace", [])
+                                        if any("widened" in t for t in trace):
+                                            viking_tag += " *(fallback)*"
+                                step_log.append(f"**Retrieve**{viking_tag} — {n} documents")
+                                if viking_enabled and (not viking_soft) and n == 0:
+                                    step_log.append(
+                                        "**Viking Strict Warning** — 0 docs in current strict scope. "
+                                        "Try soft mode, increase max expansions, or tune min_hits."
                                     )
-                                    strict_zero_doc_warned = True
-                            if grading_enabled:
-                                pipeline_status.update(label="Grading documents...")
-                            else:
+                                    if not strict_zero_doc_warned:
+                                        st.warning(
+                                            "Viking strict scope returned 0 documents. "
+                                            "Suggested actions: switch to soft mode, "
+                                            "increase Viking Max Expansions, adjust min_hits."
+                                        )
+                                        strict_zero_doc_warned = True
+                                if grading_enabled:
+                                    pipeline_status.update(label="Grading documents...")
+                                else:
+                                    pipeline_status.update(label="Generating answer...")
+
+                            elif key == "grade_documents":
+                                n = len(value.get("documents", []))
+                                if grading_enabled:
+                                    step_log.append(f"**Grade Documents** — {n} relevant")
+                                else:
+                                    step_log.append(f"**Grade Documents** — skipped (all {n} passed)")
                                 pipeline_status.update(label="Generating answer...")
 
-                        elif key == "grade_documents":
-                            n = len(value.get("documents", []))
-                            if grading_enabled:
-                                step_log.append(f"**Grade Documents** — {n} relevant")
-                            else:
-                                step_log.append(f"**Grade Documents** — skipped (all {n} passed)")
-                            pipeline_status.update(label="Generating answer...")
+                            elif key == "rewrite":
+                                q = value.get("question", "")
+                                count = value.get("search_count", "?")
+                                step_log.append(f"**Rewrite Query** (attempt {count}) — {q[:100]}")
+                                pipeline_status.update(label="Re-retrieving...")
 
-                        elif key == "rewrite":
-                            q = value.get("question", "")
-                            count = value.get("search_count", "?")
-                            step_log.append(f"**Rewrite Query** (attempt {count}) — {q[:100]}")
-                            pipeline_status.update(label="Re-retrieving...")
-
-                        elif key == "generate" and "generation" in value:
-                            step_log.append("**Generate** — Answer produced")
-                            if hallucination_check_enabled:
-                                pipeline_status.update(label="Checking hallucination...")
-                            else:
-                                pipeline_status.update(label="Finalizing...")
-                            generate_output = value
-                            full_response = value["generation"]
-                            final_answer_found = True
-                            message_placeholder.markdown(full_response)
-
-                        elif key == "check_hallucination":
-                            if hallucination_check_enabled:
-                                h = value.get("hallucination_status", "unknown")
-                                label = "GROUNDED" if h == "pass" else "FAILED"
-                                step_log.append(f"**Hallucination Check** — {label}")
-                            else:
-                                step_log.append("**Hallucination Check** — skipped")
-                            if "generation" in value:
-                                full_response = value["generation"]
+                            elif key == "generate" and "generation" in value:
+                                step_log.append("**Generate** — Answer produced")
+                                if hallucination_check_enabled:
+                                    pipeline_status.update(label="Checking hallucination...")
+                                else:
+                                    pipeline_status.update(label="Finalizing...")
                                 generate_output = value
+                                full_response = value["generation"]
+                                final_answer_found = True
                                 message_placeholder.markdown(full_response)
 
-                        step_placeholder.markdown("\n".join(f"- {s}" for s in step_log))
+                            elif key == "check_hallucination":
+                                if hallucination_check_enabled:
+                                    h = value.get("hallucination_status", "unknown")
+                                    label = "GROUNDED" if h == "pass" else "FAILED"
+                                    step_log.append(f"**Hallucination Check** — {label}")
+                                else:
+                                    step_log.append("**Hallucination Check** — skipped")
+                                if "generation" in value:
+                                    full_response = value["generation"]
+                                    generate_output = value
+                                    message_placeholder.markdown(full_response)
+
+                            step_placeholder.markdown("\n".join(f"- {s}" for s in step_log))
 
             except Exception as e:
                 st.error(f"An error occurred: {e}")

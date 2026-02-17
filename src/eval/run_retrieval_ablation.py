@@ -135,13 +135,8 @@ def run_condition(
     """Run all queries under a single condition. Returns condition-level metrics."""
     patched_config = _apply_overrides(base_config, overrides)
 
-    # Monkey-patch load_config for this condition
-    src.utils.load_config = lambda _cfg=patched_config: deepcopy(_cfg)
-
-    # Import after patching so __init__ reads the patched config
+    # Import here to keep this harness retrieval-core only.
     from src.retrieve.rag_retrieve import RAGRetriever
-
-    retriever = RAGRetriever()
 
     condition_metrics = {
         "condition": condition_name,
@@ -149,68 +144,59 @@ def run_condition(
         "queries": [],
     }
 
-    for qi, q_entry in enumerate(queries):
-        query_text = q_entry["query"]
-        metadata = q_entry.get("metadata") or {}
-        query_hash = _sha256_short(query_text)
+    with src.utils.use_config_override(patched_config):
+        with RAGRetriever() as retriever:
+            for qi, q_entry in enumerate(queries):
+                query_text = q_entry["query"]
+                metadata = q_entry.get("metadata") or {}
+                query_hash = _sha256_short(query_text)
 
-        print(f"\n{'='*60}")
-        print(f"[{condition_name}] Query {qi+1}/{len(queries)}: {query_text}")
-        print(f"{'='*60}")
+                print(f"\n{'='*60}")
+                print(f"[{condition_name}] Query {qi+1}/{len(queries)}: {query_text}")
+                print(f"{'='*60}")
 
-        t0 = time.monotonic()
-        try:
-            docs = retriever.retrieve_documents(query_text, metadata=metadata)
-        except Exception as e:
-            print(f"ERROR: {e}")
-            docs = []
-        elapsed = time.monotonic() - t0
+                t0 = time.monotonic()
+                try:
+                    docs = retriever.retrieve_documents(query_text, metadata=metadata)
+                except Exception as e:
+                    print(f"ERROR: {e}")
+                    docs = []
+                elapsed = time.monotonic() - t0
 
-        # Build audit record
-        doc_records = []
-        for d in docs:
-            doc_records.append({
-                "source_file": d.metadata.get("source_file"),
-                "ref_id": d.metadata.get("ref_id"),
-                "level": d.metadata.get("level"),
-                "score": d.metadata.get("score"),
-                "chunk_id": d.metadata.get("chunk_id"),
-                "lang": d.metadata.get("lang"),
-                "_viking_scope": d.metadata.get("_viking_scope"),
-            })
+                # Build audit record
+                doc_records = []
+                for d in docs:
+                    doc_records.append({
+                        "source_file": d.metadata.get("source_file"),
+                        "ref_id": d.metadata.get("ref_id"),
+                        "level": d.metadata.get("level"),
+                        "score": d.metadata.get("score"),
+                        "chunk_id": d.metadata.get("chunk_id"),
+                        "lang": d.metadata.get("lang"),
+                        "_viking_scope": d.metadata.get("_viking_scope"),
+                    })
 
-        audit_entry = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "condition": condition_name,
-            "query": query_text,
-            "query_hash": query_hash,
-            "metadata": metadata,
-            "n_docs": len(docs),
-            "elapsed_sec": round(elapsed, 3),
-            "docs": doc_records,
-        }
-        audit_fp.write(json.dumps(audit_entry, ensure_ascii=False) + "\n")
-        audit_fp.flush()
+                audit_entry = {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "condition": condition_name,
+                    "query": query_text,
+                    "query_hash": query_hash,
+                    "metadata": metadata,
+                    "n_docs": len(docs),
+                    "elapsed_sec": round(elapsed, 3),
+                    "docs": doc_records,
+                }
+                audit_fp.write(json.dumps(audit_entry, ensure_ascii=False) + "\n")
+                audit_fp.flush()
 
-        # Condition-level metrics placeholder
-        condition_metrics["queries"].append({
-            "query": query_text,
-            "query_hash": query_hash,
-            "n_docs": len(docs),
-            "elapsed_sec": round(elapsed, 3),
-            "source_files": [d["source_file"] for d in doc_records],
-        })
-
-    # Cleanup retriever to free VRAM/connections
-    try:
-        close_method = getattr(retriever, "close", None)
-        if callable(close_method):
-            close_method()
-        elif getattr(retriever, "conn", None) is not None:
-            retriever.conn.close()
-    except Exception:
-        pass
-    del retriever
+                # Condition-level metrics placeholder
+                condition_metrics["queries"].append({
+                    "query": query_text,
+                    "query_hash": query_hash,
+                    "n_docs": len(docs),
+                    "elapsed_sec": round(elapsed, 3),
+                    "source_files": [d["source_file"] for d in doc_records],
+                })
 
     return condition_metrics
 
@@ -265,10 +251,6 @@ def main():
     # Save base config for this run
     base_config = src.utils.load_config()
 
-    # Store original load_config to restore after each condition
-    if not hasattr(src.utils, "_original_load_config"):
-        src.utils._original_load_config = src.utils.load_config
-
     audit_path = os.path.join(out_dir, "audit.jsonl")
     metrics_path = os.path.join(out_dir, "metrics.json")
 
@@ -285,9 +267,6 @@ def main():
                 cond_name, overrides, queries, base_config, audit_fp
             )
             all_metrics["conditions"].append(cond_metrics)
-
-            # Restore original config loader between conditions
-            src.utils.load_config = src.utils._original_load_config
 
     all_metrics["run"]["end_time"] = datetime.now(timezone.utc).isoformat()
 

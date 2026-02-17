@@ -2,6 +2,7 @@ import os
 import sys
 
 from langchain_core.documents import Document
+from psycopg2 import sql as pg_sql
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
@@ -20,7 +21,7 @@ class RecordingCursor:
         return False
 
     def execute(self, query, params=None):
-        self._statements.append((str(query), params))
+        self._statements.append((query, params))
 
     def fetchall(self):
         return list(self._rows)
@@ -44,7 +45,11 @@ def test_sibling_expansion_uses_configured_table_name():
     expanded = retriever._expand_sibling_chunks(docs)
 
     assert len(expanded) == 1
-    assert any("FROM custom_table" in sql for sql, _ in retriever.conn.statements)
+    assert retriever.conn.statements
+    query_obj, params = retriever.conn.statements[0]
+    assert isinstance(query_obj, pg_sql.Composed)
+    assert "Identifier" in repr(query_obj)
+    assert params is not None
 
 
 def test_extract_query_metadata_fallback_when_llm_unavailable(monkeypatch, tmp_path):

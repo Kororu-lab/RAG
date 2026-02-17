@@ -14,6 +14,14 @@ EMBEDDINGS_FILE = os.path.join(COLPALI_OUTPUT_DIR, "embeddings.pt")
 METADATA_OUTPUT_FILE = os.path.join(COLPALI_OUTPUT_DIR, "indexed_metadata.json")
 MODEL_NAME = "vidore/colpali-v1.2"
 
+
+def _safe_torch_load(path: str):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
 class ColPaliRetriever:
     _instance = None
     _model = None
@@ -62,7 +70,7 @@ class ColPaliRetriever:
         self._processor = ColPaliProcessor.from_pretrained(MODEL_NAME)
         
         print("Loading ColPali Index...")
-        self._embeddings = torch.load(EMBEDDINGS_FILE, map_location="cpu")
+        self._embeddings = _safe_torch_load(EMBEDDINGS_FILE)
         with open(METADATA_OUTPUT_FILE, 'r', encoding='utf-8') as f:
             self._metadata = json.load(f)
 
