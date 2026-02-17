@@ -3,7 +3,11 @@ import json
 import torch
 from typing import List, Dict
 from colpali_engine.models import ColPali, ColPaliProcessor
-from src.utils import load_config, resolve_torch_device
+from src.utils import (
+    load_config,
+    resolve_torch_device,
+    resolve_vision_device_and_dtype,
+)
 
 COLPALI_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "../../data/ltdb_colpali")
 EMBEDDINGS_FILE = os.path.join(COLPALI_OUTPUT_DIR, "embeddings.pt")
@@ -16,6 +20,8 @@ class ColPaliRetriever:
     _processor = None
     _embeddings = None
     _metadata = None
+    _device = "cpu"
+    _dtype = torch.float32
 
     def __new__(cls):
         if cls._instance is None:
@@ -32,16 +38,23 @@ class ColPaliRetriever:
 
         print("Loading ColPali Model...")
         config = load_config()
-        configured_device = config.get("embedding", {}).get("device", "auto")
-        device = resolve_torch_device(configured_device)
-        
-        # MPS: Use float16 for best performance and memory usage
-        if device == "cuda":
-            dtype = torch.bfloat16
-        elif device == "mps":
-            dtype = torch.float16
-        else:
-            dtype = torch.float32
+        vision_cfg = config.get("vision", {}) or {}
+        embedding_cfg = config.get("embedding", {}) or {}
+        requested = vision_cfg.get("device") or embedding_cfg.get("device") or "auto"
+        raw_resolved = resolve_torch_device(requested)
+        device, dtype = resolve_vision_device_and_dtype(config)
+        self._device = device
+        self._dtype = dtype
+
+        if (
+            raw_resolved == "mps"
+            and device == "cpu"
+            and vision_cfg.get("mps_fallback_to_cpu", True)
+        ):
+            print(
+                "[Vision] MPS detected but using CPU for ColPali stability "
+                "(vision.mps_fallback_to_cpu=true)."
+            )
         
         self._model = ColPali.from_pretrained(
             MODEL_NAME, torch_dtype=dtype, device_map=device
@@ -68,10 +81,14 @@ class ColPaliRetriever:
             doc_embeddings = torch.stack(doc_embeddings)
             
         with torch.no_grad():
-            batch_query = self._processor.process_queries([query]).to(self._model.device)
+            batch_query = self._processor.process_queries([query]).to(self._device)
             query_embeddings = self._model(**batch_query)
 
-        doc_embeddings = doc_embeddings.to(query_embeddings.device)
+        if isinstance(query_embeddings, (tuple, list)):
+            query_embeddings = query_embeddings[0]
+
+        query_embeddings = query_embeddings.to(device=self._device, dtype=self._dtype)
+        doc_embeddings = doc_embeddings.to(device=self._device, dtype=self._dtype)
         Q = query_embeddings[0]
 
         # MaxSim

@@ -41,6 +41,11 @@ embedding:
   device: "auto" # auto prefers cuda, then mps, then cpu; explicit values: cuda/mps/cpu with fallback
   normalize_embeddings: true
 
+vision:
+  device: "auto"                # auto|cuda|mps|cpu
+  mps_fallback_to_cpu: true     # fallback to CPU for ColPali stability
+  ingest_store_dtype: "float32" # float32|float16|bfloat16
+
 retrieval:
   search_type: "similarity" # or "mmr"
   k: 30 # Initial retrieval count

@@ -12,7 +12,11 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from src.utils import load_config, resolve_torch_device
+from src.utils import (
+    load_config,
+    resolve_vision_device_and_dtype,
+    resolve_vision_store_dtype,
+)
 
 VISION_DIR = os.path.join(os.path.dirname(__file__), "../../../data/ltdb_vision")
 METADATA_FILE = os.path.join(VISION_DIR, "metadata.jsonl") 
@@ -33,25 +37,15 @@ def load_metadata(path: str) -> List[Dict]:
             if line.strip():
                 data.append(json.loads(line))
     return data
-
-    return data
     
 
 
 def main():
     config = load_config()
-    configured_device = config.get("embedding", {}).get("device", "auto")
-    device = resolve_torch_device(configured_device)
+    device, dtype = resolve_vision_device_and_dtype(config)
+    store_dtype = resolve_vision_store_dtype(config)
 
     print(f"Using device: {device}")
-    
-    # MPS: Use float16 for best performance and memory usage (fp32 causes swapping on <32GB RAM)
-    if device == "cuda":
-        dtype = torch.bfloat16
-    elif device == "mps":
-        dtype = torch.float16
-    else:
-        dtype = torch.float32
     
     model = ColPali.from_pretrained(
         MODEL_NAME,
@@ -100,7 +94,7 @@ def main():
                 sub_imgs = chunk_images[j : j + BATCH_SIZE]
                 batch_dict = processor.process_images(sub_imgs).to(model.device)
                 batch_embeddings = model(**batch_dict)
-                all_embeddings.append(batch_embeddings.cpu())
+                all_embeddings.append(batch_embeddings.to(dtype=store_dtype).cpu())
 
         final_metadata.extend(chunk_valid_meta)
 

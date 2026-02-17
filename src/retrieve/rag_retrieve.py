@@ -674,20 +674,26 @@ class RAGRetriever:
         return docs + sibling_docs
 
     def retrieve_vision(self, query: str, metadata: Dict[str, Any]):
-        print("Initializing Vision Retriever (ColPali)...")
-        vision_retriever = ColPaliRetriever()
-        vision_retriever.initialize()
-        
-        # Use lang from metadata as filter
-        lang_filter = metadata.get('lang')
-        results = vision_retriever.search(query, top_k=3, lang_filter=lang_filter)
-        
-        # Cleanup Vision Model IMMEDIATELY
-        del vision_retriever
-        self._clean_memory()
-        print("Vision Retriever unloaded.")
-        
-        return results
+        vision_retriever = None
+        try:
+            print("Initializing Vision Retriever (ColPali)...")
+            vision_retriever = ColPaliRetriever()
+            vision_retriever.initialize()
+
+            # Use lang from metadata as filter
+            lang_filter = metadata.get('lang')
+            return vision_retriever.search(query, top_k=3, lang_filter=lang_filter)
+        except Exception as e:
+            print(f"Vision retrieval failed: {e}")
+            return []
+        finally:
+            if vision_retriever is not None:
+                try:
+                    del vision_retriever
+                except Exception:
+                    pass
+            self._clean_memory()
+            print("Vision Retriever unloaded.")
 
     def perform_rerank(self, query: str, docs: List[Document], top_n: int = None):
         if top_n is None:

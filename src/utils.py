@@ -57,6 +57,42 @@ def resolve_torch_device(configured_device: str | None = "auto") -> str:
     return "cpu"
 
 
+def resolve_vision_device_and_dtype(config: dict) -> tuple[str, "torch.dtype"]:
+    torch = _safe_import_torch()
+    if torch is None:
+        raise RuntimeError("torch is required for vision device and dtype resolution.")
+
+    vision_cfg = config.get("vision", {}) or {}
+    embedding_cfg = config.get("embedding", {}) or {}
+
+    requested = vision_cfg.get("device") or embedding_cfg.get("device") or "auto"
+    resolved = resolve_torch_device(requested)
+
+    if resolved == "mps" and vision_cfg.get("mps_fallback_to_cpu", True):
+        return "cpu", torch.float32
+    if resolved == "cuda":
+        return "cuda", torch.bfloat16
+    if resolved == "mps":
+        return "mps", torch.float16
+    return "cpu", torch.float32
+
+
+def resolve_vision_store_dtype(config: dict) -> "torch.dtype":
+    torch = _safe_import_torch()
+    if torch is None:
+        raise RuntimeError("torch is required for vision dtype resolution.")
+
+    vision_cfg = config.get("vision", {}) or {}
+    requested = str(vision_cfg.get("ingest_store_dtype", "float32")).lower()
+
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    return dtype_map.get(requested, torch.float32)
+
+
 def clear_torch_cache() -> None:
     torch = _safe_import_torch()
     if torch is None:
