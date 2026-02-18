@@ -14,11 +14,11 @@ from src.utils import LLMUtility, load_config
 
 
 
-def get_rag_chain():
+def get_rag_chain(request_timeout_sec: int | None = None):
     """
     Creates and returns the RAG generation chain.
     """
-    llm = get_llm("retrieval")
+    llm = get_llm("retrieval", request_timeout_sec=request_timeout_sec)
 
     system_text = """당신은 언어학 데이터베이스(LTDB) 전문 연구원입니다.
 1. **문맥 기반 답변 (Truthfulness)**
@@ -60,11 +60,15 @@ Answer:"""
     chain = prompt | llm | StrOutputParser()
     return chain
 
-def generate_answer(query: str, context: str) -> str:
+def generate_answer(
+    query: str,
+    context: str,
+    request_timeout_sec: int | None = None,
+) -> str:
     """
     Generates an answer string programmatically.
     """
-    chain = get_rag_chain()
+    chain = get_rag_chain(request_timeout_sec=request_timeout_sec)
     response = chain.invoke({"context": context, "question": query})
     return response
 

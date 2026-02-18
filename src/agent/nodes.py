@@ -57,10 +57,17 @@ def _get_generation_timeout_sec(default_sec: int = 60) -> int:
 
 def _generate_with_timeout(query: str, context: str, timeout_sec: int) -> str:
     result = {"value": None, "error": None}
+    timeout_fallback = (
+        f"정보가 부족합니다\n\n(답변 생성 시간 제한 {timeout_sec}초를 초과했습니다.)"
+    )
 
     def _worker():
         try:
-            result["value"] = generate_answer(query=query, context=context)
+            result["value"] = generate_answer(
+                query=query,
+                context=context,
+                request_timeout_sec=timeout_sec,
+            )
         except Exception as e:
             result["error"] = e
 
@@ -69,9 +76,11 @@ def _generate_with_timeout(query: str, context: str, timeout_sec: int) -> str:
     t.join(timeout=timeout_sec)
 
     if t.is_alive():
-        return f"정보가 부족합니다\n\n(답변 생성 시간 제한 {timeout_sec}초를 초과했습니다.)"
+        return timeout_fallback
 
     if result["error"] is not None:
+        if "timeout" in str(result["error"]).lower():
+            return timeout_fallback
         raise result["error"]
 
     return result["value"]
@@ -106,7 +115,7 @@ def retrieve_node(state: GraphState):
     
     mid_broad_keywords = [
         # Topic-specific linguistics terms
-        "상", "aspect", "시상", "tense", "양태", "modality", "mood",
+        "aspect", "시상", "tense", "양태", "modality", "mood",
         "연동", "serial", "svc", "구문", "construction",
         "음운", "phonology", "phoneme", "자음", "모음", "vowel", "consonant",
         "어순", "word order", "화제", "topic", "주어", "subject",

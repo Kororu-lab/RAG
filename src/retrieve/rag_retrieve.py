@@ -11,7 +11,9 @@ import argparse
 import psycopg2
 from psycopg2 import sql
 import time
+import re
 from typing import List, Dict, Any
+from copy import deepcopy
 from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
 from sentence_transformers import CrossEncoder
@@ -78,21 +80,17 @@ def parse_detected_languages(result: str, known_languages: List[str]) -> Any:
     if normalized.lower() in {"", "none", "null"}:
         return None
 
-    detected_langs = []
-    candidates = [candidate.strip() for candidate in normalized.split(",")]
-    for candidate in candidates:
+    def _map_candidate(candidate: str):
+        candidate = (candidate or "").strip()
         if not candidate:
-            continue
+            return None
 
-        exact_match = None
         if candidate in known_languages:
-            exact_match = candidate
-        else:
-            exact_match = known_languages_lookup.get(candidate.lower())
+            return candidate
 
+        exact_match = known_languages_lookup.get(candidate.lower())
         if exact_match:
-            detected_langs.append(exact_match)
-            continue
+            return exact_match
 
         matches = difflib.get_close_matches(
             candidate.lower(),
@@ -103,7 +101,35 @@ def parse_detected_languages(result: str, known_languages: List[str]) -> Any:
         if matches:
             mapped = known_languages_lookup[matches[0]]
             print(f"Mapped '{candidate}' to known language '{mapped}'")
+            return mapped
+
+        return None
+
+    split_pattern = r"\s*(?:,|/|;|&|\band\b|및|와|과)\s*"
+    candidates = [
+        candidate.strip()
+        for candidate in re.split(split_pattern, normalized, flags=re.IGNORECASE)
+        if candidate.strip()
+    ]
+    if not candidates:
+        return None
+
+    detected_langs = []
+    for candidate in candidates:
+        mapped = _map_candidate(candidate)
+        if mapped:
             detected_langs.append(mapped)
+
+    if len(candidates) == 1:
+        raw_lower = normalized.lower()
+        embedded_hits = []
+        for lang_lower, canonical in known_languages_lookup.items():
+            pos = raw_lower.find(lang_lower)
+            if pos >= 0:
+                embedded_hits.append((pos, canonical))
+        if len(embedded_hits) >= 2:
+            embedded_hits.sort(key=lambda item: item[0])
+            detected_langs = [lang for _, lang in embedded_hits]
 
     detected_langs = list(dict.fromkeys(detected_langs))
     if len(detected_langs) == 1:
@@ -826,14 +852,14 @@ class RAGRetriever:
             print(f"Vision Search Matches: {len(visual_results)}")
             
             for res in visual_results:
-                meta = res['metadata']
+                meta = deepcopy(res.get("metadata") or {})
                 # Create a pseudo-Document for Vision
                 content = f"[Vision Content] Type: {meta.get('element_type')}\n"
                 if 'context_preview' in meta:
                     content += f"Text in Image: {meta['context_preview']}\n"
                 
                 # Add score to metadata
-                meta['score'] = res['score']
+                meta['score'] = res.get('score')
                 meta['type'] = 'vision'
                 
                 doc = Document(page_content=content, metadata=meta)

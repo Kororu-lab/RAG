@@ -12,7 +12,7 @@ except ImportError:
 
 from src.utils import load_config
 
-def get_llm(profile: str = "retrieval"):
+def get_llm(profile: str = "retrieval", request_timeout_sec: int | None = None):
     """
     Factory function to get LLM instance based on profile ('ingestion' or 'retrieval').
     """
@@ -37,12 +37,17 @@ def get_llm(profile: str = "retrieval"):
     
     # 1. Ollama
     if provider == "ollama":
+        ollama_kwargs = {
+            "model": model_name,
+            "temperature": temperature,
+            "base_url": base_url,
+            "num_ctx": cfg.get("num_ctx", 4096),
+            "keep_alive": "30m",  # Keep alive for performance
+        }
+        if request_timeout_sec is not None:
+            ollama_kwargs["timeout"] = request_timeout_sec
         return ChatOllama(
-            model=model_name,
-            temperature=temperature,
-            base_url=base_url,
-            num_ctx=cfg.get("num_ctx", 4096),
-            keep_alive="30m" # Keep alive for performance
+            **ollama_kwargs
         )
     
     # 2. OpenAI / DeepSeek
@@ -62,12 +67,16 @@ def get_llm(profile: str = "retrieval"):
         if not api_key:
              raise ValueError(f"API Key not found. Checked env var '{api_key_conf}' and direct value.")
 
-        return ChatOpenAI(
-            model=model_name,
-            temperature=temperature,
-            base_url=base_url,
-            api_key=api_key
-        )
+        openai_kwargs = {
+            "model": model_name,
+            "temperature": temperature,
+            "base_url": base_url,
+            "api_key": api_key,
+        }
+        if request_timeout_sec is not None:
+            openai_kwargs["request_timeout"] = request_timeout_sec
+
+        return ChatOpenAI(**openai_kwargs)
 
     # 3. Anthropic
     elif provider == "anthropic":
