@@ -1,0 +1,41 @@
+flowchart TD
+  A["retrieve called"] --> B{"Viking enabled"}
+  B -- "No" --> Z["Normal retrieval path"]
+  B -- "Yes" --> C["Load taxonomy index with get_taxonomy_index"]
+  C --> D["Compute scope with compute_scope"]
+
+  D --> D1["Load lexicons from configured lexicon path"]
+  D --> D2["Read language metadata lang"]
+  D --> D3["Match phenomenon terms longest first"]
+  D --> D4["If no phenomenon match then try category terms"]
+  D --> D5["Build path patterns confidence and trace"]
+
+  D5 --> E["Run retrieve_text with viking_scope"]
+  E --> F["Vector SQL with source_file LIKE patterns"]
+
+  F --> G{"Soft mode and low hits with attempts left"}
+  G -- "Yes" --> H["Widen scope"]
+  H --> H1["phenomena to categories"]
+  H1 --> H2["categories to language only"]
+  H2 --> H3["language only to unrestricted"]
+  H3 --> F
+  G -- "No" --> I{"Hybrid BM25 enabled"}
+
+  I -- "Yes" --> J{"Mode strict"}
+  J -- "Yes" --> J1["Pre-filter BM25 by Viking patterns"]
+  J -- "No" --> J2["Skip BM25 pre-filter"]
+  I -- "No" --> K["Merge results"]
+
+  J1 --> K
+  J2 --> K
+  K --> L["Post-fusion scope guard"]
+
+  L --> M{"Mode strict"}
+  M -- "Yes" --> N["Drop all out-of-scope docs"]
+  M -- "No" --> O{"At least three in-scope docs"}
+  O -- "Yes" --> P["Drop out-of-scope docs"]
+  O -- "No" --> Q["Keep out-of-scope docs too"]
+
+  N --> R["Return docs and stamp viking scope metadata"]
+  P --> R
+  Q --> R

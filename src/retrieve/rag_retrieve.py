@@ -39,45 +39,28 @@ except ImportError as e:
     print(f"BM25 not available: {e}")
     BM25_AVAILABLE = False
 
-
-
-def detect_topic_with_llm(query: str, llm) -> str:
-    """Detect linguistic domain with a safe default."""
-    valid_topics = ["Phonology", "Grammar", "Lexicon", "General"]
-    if llm is None:
-        return "General"
-
-    topic_prompt = ChatPromptTemplate.from_template(
-        """Analyze the user's query and classify it into one of the following Linguistic Domains:
-- Phonology (Sounds, Tones, IPA, Phonemes)
-- Grammar (Syntax, Morphology, Sentence Structure)
-- Lexicon (Words, Vocabulary, Dictionary)
-- General (History, Demographics, Metadata, Others)
-
-Query: {query}
-Domain (Return ONLY the category name):"""
-    )
-
-    try:
-        chain_topic = topic_prompt | llm | StrOutputParser()
-        topic_result = (chain_topic.invoke({"query": query}) or "").strip()
-    except Exception as e:
-        print(f"Topic detection failed: {e}")
-        return "General"
-
-    topic_result_lower = topic_result.lower()
-    for topic in valid_topics:
-        if topic.lower() in topic_result_lower:
-            return topic
-
-    return "General"
-
-
 def parse_detected_languages(result: str, known_languages: List[str]) -> Any:
-    """Parse LLM language output into None/str/list with exact+fuzzy matching."""
+    """Parse detector output into None/str/list with closed-world matching."""
     known_languages_lookup = {lang.lower(): lang for lang in known_languages}
     normalized = (result or "").strip()
     if normalized.lower() in {"", "none", "null"}:
+        return None
+
+    def _parse_json_payload(text: str):
+        candidates = [text]
+        fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, flags=re.IGNORECASE)
+        if fence_match:
+            candidates.insert(0, fence_match.group(1).strip())
+
+        bracket_match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", text)
+        if bracket_match:
+            candidates.append(bracket_match.group(1).strip())
+
+        for candidate in candidates:
+            try:
+                return json.loads(candidate)
+            except Exception:
+                continue
         return None
 
     def _map_candidate(candidate: str):
@@ -105,12 +88,27 @@ def parse_detected_languages(result: str, known_languages: List[str]) -> Any:
 
         return None
 
-    split_pattern = r"\s*(?:,|/|;|&|\band\b|및|와|과)\s*"
-    candidates = [
-        candidate.strip()
-        for candidate in re.split(split_pattern, normalized, flags=re.IGNORECASE)
-        if candidate.strip()
-    ]
+    structured = _parse_json_payload(normalized)
+    candidates: List[str] = []
+    if isinstance(structured, dict):
+        values = structured.get("languages", [])
+        if isinstance(values, str):
+            candidates = [values]
+        elif isinstance(values, list):
+            candidates = [str(v).strip() for v in values if str(v).strip()]
+    elif isinstance(structured, list):
+        candidates = [str(v).strip() for v in structured if str(v).strip()]
+    elif isinstance(structured, str) and structured.strip():
+        candidates = [structured.strip()]
+
+    if not candidates:
+        split_pattern = r"\s*(?:,|/|;|&|\band\b|및|와|과)\s*"
+        candidates = [
+            candidate.strip()
+            for candidate in re.split(split_pattern, normalized, flags=re.IGNORECASE)
+            if candidate.strip()
+        ]
+
     if not candidates:
         return None
 
@@ -143,54 +141,51 @@ def parse_detected_languages(result: str, known_languages: List[str]) -> Any:
 
 def extract_query_metadata(query: str, config: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Extracts metadata (Language, Topic) from the user query.
-    1. Language Detection (Fast Path or LLM)
-    2. Topic Fallback (if Language is None)
-    
-    Returns: {'lang': str|None, 'topic': str|None}
+    Extracts metadata (Language) from the user query.
+
+    Returns: {'lang': str|list|None}
     """
-    metadata = {'lang': None, 'topic': None}
+    metadata = {'lang': None}
 
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-    # Language Detection
-    # Fast Path: Check against known directory names
+    # Language candidates come from doc directory names (closed-world set)
     data_path = config["project"]["data_path"]
     doc_dir = os.path.join(data_path, "doc")
     known_languages = []
     if os.path.exists(doc_dir):
         known_languages = [d for d in os.listdir(doc_dir) if os.path.isdir(os.path.join(doc_dir, d))]
 
-    # [COMMENTED OUT] Fast Path - kept for future optimization if LLM latency becomes an issue
-    # detected_langs = []
-    # for lang in known_languages:
-    #     if lang in query.lower():
-    #         detected_langs.append(lang)
-    # if detected_langs:
-    #     metadata['lang'] = detected_langs if len(detected_langs) > 1 else detected_langs[0]
-
-    # LLM-based language detection (handles Korean, Chinese, English names)
+    # LLM-based language detection (closed-world against doc directory names)
     llm = None
     print("Using LLM for language detection...")
 
     try:
         llm = get_llm("retrieval")
-
+        allowed_languages_json = json.dumps(sorted(known_languages), ensure_ascii=False)
         lang_prompt = ChatPromptTemplate.from_template(
-            """Analyze the user's query and identify if a specific language is being asked about.
-If found, translate it to its standard English Academic name.
-If no specific language is targeted, return "None".
+            """Identify all languages explicitly requested in the query.
+You must select from this allowed language ID set only:
+{allowed_languages_json}
 
-- Query: "Language A의 성조는?" -> "Language A"
-- Query: "What is the tone in Language B?" -> "Language B"
-- Query: "Explain the grammar." -> "None"
+Return JSON only, in this schema:
+{{"languages": ["lang_id_1", "lang_id_2"]}}
+
+Rules:
+1) Include every explicitly mentioned language in query order.
+2) Never output values outside the allowed set.
+3) If no language is explicit, return {{"languages": []}}.
+4) No prose, no markdown, JSON only.
 
 Query: {query}
-Language Name (English only, no punctuation):"""
+JSON:"""
         )
 
         chain = lang_prompt | llm | StrOutputParser()
-        result = (chain.invoke({"query": query}) or "").strip()
+        result = (chain.invoke({
+            "query": query,
+            "allowed_languages_json": allowed_languages_json,
+        }) or "").strip()
         print(f"LLM Detected Language: {result}")
         parsed_lang = parse_detected_languages(result, known_languages)
         if isinstance(parsed_lang, list):
@@ -199,11 +194,6 @@ Language Name (English only, no punctuation):"""
 
     except Exception as e:
         print(f"Metadata extraction failed: {e}")
-
-    if not metadata['lang']:
-        print("Language not detected. Triggering Topic Fallback...")
-        metadata['topic'] = detect_topic_with_llm(query, llm)
-        print(f"LLM Detected Topic: {metadata['topic']}")
 
     # Cleanup
     print("Ensuring VRAM is clean (Unloading Ollama)...")
@@ -261,7 +251,7 @@ class RAGRetriever:
         
         # Vision and recursive retrieval config
         retrieval_cfg = self.config.get("retrieval", {})
-        self.vision_enabled = retrieval_cfg.get("vision_search", True)
+        self.vision_enabled = retrieval_cfg.get("vision_search", False)
         self.recursive_enabled = retrieval_cfg.get("recursive_retrieval", True)
 
         # Viking routing config
