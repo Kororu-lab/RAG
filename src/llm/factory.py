@@ -12,6 +12,30 @@ except ImportError:
 
 from src.utils import load_config
 
+
+def _resolve_request_timeout(
+    cfg: dict,
+    profile: str,
+    request_timeout_sec: int | None,
+) -> int | None:
+    """
+    Resolve request timeout with config-backed defaults.
+    Retrieval-side calls default to llm_retrieval.request_timeout_sec.
+    """
+    if request_timeout_sec is not None:
+        return request_timeout_sec
+
+    if profile != "retrieval":
+        return None
+
+    raw_timeout = cfg.get("request_timeout_sec", 45)
+    try:
+        timeout = int(raw_timeout)
+        return timeout if timeout > 0 else 45
+    except Exception:
+        return 45
+
+
 def get_llm(profile: str = "retrieval", request_timeout_sec: int | None = None):
     """
     Factory function to get LLM instance based on profile ('ingestion' or 'retrieval').
@@ -34,6 +58,11 @@ def get_llm(profile: str = "retrieval", request_timeout_sec: int | None = None):
     model_name = cfg.get("model_name")
     temperature = cfg.get("temperature", 0.1) # 0.1, 필요 부분에서 0으로 override
     base_url = cfg.get("base_url")
+    resolved_timeout = _resolve_request_timeout(
+        cfg=cfg,
+        profile=profile,
+        request_timeout_sec=request_timeout_sec,
+    )
     
     # 1. Ollama
     if provider == "ollama":
@@ -44,8 +73,8 @@ def get_llm(profile: str = "retrieval", request_timeout_sec: int | None = None):
             "num_ctx": cfg.get("num_ctx", 4096),
             "keep_alive": "30m",  # Keep alive for performance
         }
-        if request_timeout_sec is not None:
-            ollama_kwargs["timeout"] = request_timeout_sec
+        if resolved_timeout is not None:
+            ollama_kwargs["timeout"] = resolved_timeout
         return ChatOllama(
             **ollama_kwargs
         )
@@ -73,8 +102,8 @@ def get_llm(profile: str = "retrieval", request_timeout_sec: int | None = None):
             "base_url": base_url,
             "api_key": api_key,
         }
-        if request_timeout_sec is not None:
-            openai_kwargs["request_timeout"] = request_timeout_sec
+        if resolved_timeout is not None:
+            openai_kwargs["request_timeout"] = resolved_timeout
 
         return ChatOpenAI(**openai_kwargs)
 

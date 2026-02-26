@@ -47,7 +47,9 @@ def compute_scope(
     q_lower = query.lower()
 
     # 1. Languages — reuse metadata already extracted by LLM in nodes.py
-    if metadata and metadata.get("lang"):
+    # Can be explicitly disabled by caller to avoid language leakage in ablations.
+    use_detected_language = bool(metadata.get("_viking_use_detected_language", True)) if metadata else True
+    if use_detected_language and metadata and metadata.get("lang"):
         lang = metadata["lang"]
         if isinstance(lang, list):
             scope.languages = [l for l in lang if l in index.languages]

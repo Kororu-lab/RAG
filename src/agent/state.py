@@ -1,7 +1,7 @@
-from typing import List, TypedDict
+from typing import Any, Dict, List, TypedDict
 from langchain_core.documents import Document
 
-class GraphState(TypedDict):
+class GraphState(TypedDict, total=False):
     """
     Represents the state of our graph.
 
@@ -18,3 +18,6 @@ class GraphState(TypedDict):
     web_search: bool
     search_count: int
     hallucination_status: str # 'pass' or 'fail'
+    warnings: List[str]
+    timeout_locations: List[str]
+    retrieval_diagnostics: Dict[str, Any]

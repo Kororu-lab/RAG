@@ -34,6 +34,12 @@ llm_retrieval:
   base_url: "http://localhost:11434"
   temperature: 0.1
   num_ctx: 8192
+  request_timeout_sec: 45
+  lang_detect_retries: 2
+  lang_detect_backoff_sec: 0.5
+  lang_detect_candidate_k: 12
+  lang_detect_card_chars: 220
+  lang_detect_global_card_chars: 90
   api_key_env: "" # Environment variable for API Key (e.g. OPENAI_API_KEY). Leave blank for Ollama.
 
 embedding:
@@ -49,6 +55,12 @@ vision:
 retrieval:
   search_type: "similarity" # or "mmr"
   k: 30 # Initial retrieval count
+  dynamic_scaling: true      # Query-dependent k/top_n scaling
+  fixed_k: 30               # Used when dynamic_scaling=false
+  fixed_top_n: 15           # Used when dynamic_scaling=false
+  l0_only: false            # Restrict retrieval to metadata.level=0 only
+  enable_language_filter: true
+  viking_use_detected_language: true
   recursive_retrieval: true  # Expand L1 summaries to L0 chunks
   vision_search: false       # ColPali vision search for tables/images
   hybrid_search:
@@ -68,6 +80,14 @@ reranker:
   enabled: true
   model_name: "BAAI/bge-reranker-v2-m3"
   top_n: 5
+  pre_rerank_cap: 300
+  max_input_chars: 4000
+
+ablation:
+  enabled: false
+  force_deterministic: false
+  reranker_policy: "follow_profile"     # force_on|force_off|follow_profile
+  required_backend_mode: "postgres"     # postgres|local_jsonl|any
 
 database:
   type: "postgres"

@@ -20,11 +20,11 @@ from sentence_transformers import CrossEncoder
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-import difflib
 
 from src.llm.factory import get_llm
 import src.utils  # Module import for dynamic patching support
 from src.utils import LLMUtility
+from src.retrieve.language_cards import build_language_cards
 
 try:
     from src.retrieve.colpali_search import ColPaliRetriever
@@ -39,8 +39,11 @@ except ImportError as e:
     print(f"BM25 not available: {e}")
     BM25_AVAILABLE = False
 
-def parse_detected_languages(result: str, known_languages: List[str]) -> Any:
-    """Parse detector output into None/str/list with closed-world matching."""
+def parse_detected_languages(result: str, known_languages: List[str], max_languages: int = 3) -> Any:
+    """
+    Parse LLM detector output strictly as JSON and validate against allowed IDs.
+    No alias, pattern, or heuristic matching is used.
+    """
     known_languages_lookup = {lang.lower(): lang for lang in known_languages}
     normalized = (result or "").strip()
     if normalized.lower() in {"", "none", "null"}:
@@ -63,31 +66,6 @@ def parse_detected_languages(result: str, known_languages: List[str]) -> Any:
                 continue
         return None
 
-    def _map_candidate(candidate: str):
-        candidate = (candidate or "").strip()
-        if not candidate:
-            return None
-
-        if candidate in known_languages:
-            return candidate
-
-        exact_match = known_languages_lookup.get(candidate.lower())
-        if exact_match:
-            return exact_match
-
-        matches = difflib.get_close_matches(
-            candidate.lower(),
-            list(known_languages_lookup.keys()),
-            n=1,
-            cutoff=0.6,
-        )
-        if matches:
-            mapped = known_languages_lookup[matches[0]]
-            print(f"Mapped '{candidate}' to known language '{mapped}'")
-            return mapped
-
-        return None
-
     structured = _parse_json_payload(normalized)
     candidates: List[str] = []
     if isinstance(structured, dict):
@@ -98,45 +76,77 @@ def parse_detected_languages(result: str, known_languages: List[str]) -> Any:
             candidates = [str(v).strip() for v in values if str(v).strip()]
     elif isinstance(structured, list):
         candidates = [str(v).strip() for v in structured if str(v).strip()]
-    elif isinstance(structured, str) and structured.strip():
-        candidates = [structured.strip()]
-
-    if not candidates:
-        split_pattern = r"\s*(?:,|/|;|&|\band\b|및|와|과)\s*"
-        candidates = [
-            candidate.strip()
-            for candidate in re.split(split_pattern, normalized, flags=re.IGNORECASE)
-            if candidate.strip()
-        ]
 
     if not candidates:
         return None
 
-    detected_langs = []
+    detected_langs: List[str] = []
     for candidate in candidates:
-        mapped = _map_candidate(candidate)
+        mapped = known_languages_lookup.get(candidate.lower())
         if mapped:
             detected_langs.append(mapped)
-
-    if len(candidates) == 1:
-        raw_lower = normalized.lower()
-        embedded_hits = []
-        for lang_lower, canonical in known_languages_lookup.items():
-            pos = raw_lower.find(lang_lower)
-            if pos >= 0:
-                embedded_hits.append((pos, canonical))
-        if len(embedded_hits) >= 2:
-            embedded_hits.sort(key=lambda item: item[0])
-            detected_langs = [lang for _, lang in embedded_hits]
 
     detected_langs = list(dict.fromkeys(detected_langs))
     if len(detected_langs) == 1:
         return detected_langs[0]
-    if 2 <= len(detected_langs) <= 3:
+    if 2 <= len(detected_langs) <= max_languages:
         return detected_langs
-    if len(detected_langs) > 3:
+    if len(detected_langs) > max_languages:
         print(f"Multi-language query: {len(detected_langs)} languages, disabling filter")
     return None
+
+
+def _as_lang_list(value: Any) -> List[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return []
+
+
+def _coerce_numeric(value: Any, default: int, minimum: int) -> int:
+    try:
+        parsed = int(value)
+        return parsed if parsed >= minimum else default
+    except Exception:
+        return default
+
+
+def _coerce_float(value: Any, default: float, minimum: float) -> float:
+    try:
+        parsed = float(value)
+        return parsed if parsed >= minimum else default
+    except Exception:
+        return default
+
+
+def _invoke_with_retry(chain, payload: Dict[str, Any], retries: int, backoff_sec: float,
+                       diagnostics: Dict[str, Any], timeout_location: str) -> str:
+    attempts = max(1, retries + 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            return (chain.invoke(payload) or "").strip()
+        except Exception as e:
+            print(
+                f"Metadata LLM call failed (location={timeout_location}, attempt={attempt}/{attempts}): {e}"
+            )
+            if _is_timeout_exception(e):
+                diagnostics["timeout_location"] = timeout_location
+            if attempt >= attempts:
+                raise
+            sleep_sec = backoff_sec * attempt
+            if sleep_sec > 0:
+                time.sleep(sleep_sec)
+    return ""
+
+
+def _is_timeout_exception(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        "timeout" in msg
+        or "read timed out" in msg
+        or "timed out" in msg
+    )
 
 
 def extract_query_metadata(query: str, config: Dict[str, Any]) -> Dict[str, Any]:
@@ -145,7 +155,23 @@ def extract_query_metadata(query: str, config: Dict[str, Any]) -> Dict[str, Any]
 
     Returns: {'lang': str|list|None}
     """
-    metadata = {'lang': None}
+    retrieval_cfg = config.get("retrieval", {})
+    diagnostics = {
+        "lang_detect_method": "none",
+        "detected_languages": [],
+        "detected_languages_candidates": [],
+        "lang_detect_stage": "none",
+        "enable_language_filter": bool(retrieval_cfg.get("enable_language_filter", True)),
+        "viking_use_detected_language": bool(retrieval_cfg.get("viking_use_detected_language", True)),
+        "viking_language_seeded": False,
+        "l0_only": bool(retrieval_cfg.get("l0_only", False)),
+        "filter_applied": False,
+        "timeout_location": "none",
+    }
+    metadata = {
+        "lang": None,
+        "_diagnostics": diagnostics,
+    }
 
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -159,41 +185,157 @@ def extract_query_metadata(query: str, config: Dict[str, Any]) -> Dict[str, Any]
     # LLM-based language detection (closed-world against doc directory names)
     llm = None
     print("Using LLM for language detection...")
+    llm_cfg = config.get("llm_retrieval", {})
+    lang_detect_retries = _coerce_numeric(llm_cfg.get("lang_detect_retries", 2), default=2, minimum=0)
+    lang_detect_backoff_sec = _coerce_float(
+        llm_cfg.get("lang_detect_backoff_sec", 0.5), default=0.5, minimum=0.0
+    )
+    lang_detect_candidate_k = _coerce_numeric(
+        llm_cfg.get("lang_detect_candidate_k", 12), default=12, minimum=2
+    )
+    lang_detect_card_chars = _coerce_numeric(
+        llm_cfg.get("lang_detect_card_chars", 220), default=220, minimum=80
+    )
+    lang_detect_global_card_chars = _coerce_numeric(
+        llm_cfg.get("lang_detect_global_card_chars", 90), default=90, minimum=60
+    )
 
     try:
+        if not known_languages:
+            print("No language directories found; skipping language detection.")
+            raise ValueError("known_languages_empty")
+
         llm = get_llm("retrieval")
         allowed_languages_json = json.dumps(sorted(known_languages), ensure_ascii=False)
-        lang_prompt = ChatPromptTemplate.from_template(
-            """Identify all languages explicitly requested in the query.
+        all_lang_ids = sorted(known_languages)
+        global_cards = build_language_cards(
+            doc_dir,
+            all_lang_ids,
+            max_chars=lang_detect_global_card_chars,
+        )
+        all_language_cards = [
+            {"id": lang_id, "card": global_cards.get(lang_id, "")}
+            for lang_id in all_lang_ids
+        ]
+        all_language_cards_json = json.dumps(all_language_cards, ensure_ascii=False)
+
+        stage_a_prompt = ChatPromptTemplate.from_template(
+            """Stage A (high-recall): identify candidate language IDs explicitly requested in the query.
 You must select from this allowed language ID set only:
 {allowed_languages_json}
 
+Allowed language cards (for grounding names/transliterations):
+{all_language_cards_json}
+
 Return JSON only, in this schema:
-{{"languages": ["lang_id_1", "lang_id_2"]}}
+{{"languages": ["lang_id_1", "lang_id_2", "..."]}}
 
 Rules:
-1) Include every explicitly mentioned language in query order.
+1) Include every explicitly mentioned language.
 2) Never output values outside the allowed set.
-3) If no language is explicit, return {{"languages": []}}.
-4) No prose, no markdown, JSON only.
+3) If uncertain between near alternatives, include both candidates.
+4) Return at most {candidate_k} IDs.
+5) If no language is explicit, return {{"languages": []}}.
+6) No prose, no markdown, JSON only.
 
 Query: {query}
 JSON:"""
         )
 
-        chain = lang_prompt | llm | StrOutputParser()
-        result = (chain.invoke({
-            "query": query,
-            "allowed_languages_json": allowed_languages_json,
-        }) or "").strip()
-        print(f"LLM Detected Language: {result}")
-        parsed_lang = parse_detected_languages(result, known_languages)
-        if isinstance(parsed_lang, list):
-            print(f"Multi-language query detected: {parsed_lang}")
-        metadata['lang'] = parsed_lang
+        stage_a_chain = stage_a_prompt | llm | StrOutputParser()
+        stage_a_result = _invoke_with_retry(
+            stage_a_chain,
+            {
+                "query": query,
+                "allowed_languages_json": allowed_languages_json,
+                "all_language_cards_json": all_language_cards_json,
+                "candidate_k": lang_detect_candidate_k,
+            },
+            retries=lang_detect_retries,
+            backoff_sec=lang_detect_backoff_sec,
+            diagnostics=diagnostics,
+            timeout_location="metadata_detection_stage_a",
+        )
+        diagnostics["lang_detect_method"] = "llm"
+        diagnostics["lang_detect_stage"] = "stage_a"
+        print(f"LLM Detected Language (stage_a): {stage_a_result}")
 
+        stage_a_parsed = parse_detected_languages(
+            stage_a_result,
+            known_languages,
+            max_languages=lang_detect_candidate_k,
+        )
+        candidate_langs = _as_lang_list(stage_a_parsed)
+        diagnostics["detected_languages_candidates"] = candidate_langs
+
+        final_parsed = None
+        if candidate_langs:
+            language_cards = build_language_cards(
+                doc_dir,
+                candidate_langs,
+                max_chars=lang_detect_card_chars,
+            )
+            candidate_cards = [
+                {"id": lang_id, "card": language_cards.get(lang_id, "")}
+                for lang_id in candidate_langs
+            ]
+            candidate_cards_json = json.dumps(candidate_cards, ensure_ascii=False)
+
+            stage_b_prompt = ChatPromptTemplate.from_template(
+                """Stage B (precision): choose final language IDs explicitly requested in the query.
+Select only from these candidate IDs:
+{candidate_langs_json}
+
+Candidate language cards:
+{candidate_cards_json}
+
+Return JSON only:
+{{"languages": ["lang_id_1", "lang_id_2"]}}
+
+Rules:
+1) Use only candidate IDs.
+2) Include only explicitly requested languages.
+3) Keep query mention order.
+4) If no explicit language, return {{"languages": []}}.
+5) No prose, no markdown, JSON only.
+
+Query: {query}
+JSON:"""
+            )
+
+            stage_b_chain = stage_b_prompt | llm | StrOutputParser()
+            stage_b_result = _invoke_with_retry(
+                stage_b_chain,
+                {
+                    "query": query,
+                    "candidate_langs_json": json.dumps(candidate_langs, ensure_ascii=False),
+                    "candidate_cards_json": candidate_cards_json,
+                },
+                retries=lang_detect_retries,
+                backoff_sec=lang_detect_backoff_sec,
+                diagnostics=diagnostics,
+                timeout_location="metadata_detection_stage_b",
+            )
+            diagnostics["lang_detect_stage"] = "stage_b"
+            print(f"LLM Detected Language (stage_b): {stage_b_result}")
+            final_parsed = parse_detected_languages(stage_b_result, known_languages, max_languages=3)
+
+        if final_parsed is None and 1 <= len(candidate_langs) <= 3:
+            final_parsed = candidate_langs if len(candidate_langs) > 1 else candidate_langs[0]
+
+        if isinstance(final_parsed, str):
+            diagnostics["detected_languages"] = [final_parsed]
+        elif isinstance(final_parsed, list):
+            diagnostics["detected_languages"] = final_parsed
+            print(f"Multi-language query detected: {final_parsed}")
+        metadata["lang"] = final_parsed
+    except ValueError as e:
+        if str(e) != "known_languages_empty":
+            print(f"Metadata extraction failed: {e}")
     except Exception as e:
         print(f"Metadata extraction failed: {e}")
+        if _is_timeout_exception(e) and diagnostics["timeout_location"] == "none":
+            diagnostics["timeout_location"] = "metadata_detection"
 
     # Cleanup
     print("Ensuring VRAM is clean (Unloading Ollama)...")
@@ -209,6 +351,20 @@ JSON:"""
     gc.collect()
     time.sleep(1)
 
+    print(
+        "LANG_DETECT_DIAGNOSTICS "
+        f"lang_detect_method={diagnostics['lang_detect_method']} "
+        f"lang_detect_stage={diagnostics.get('lang_detect_stage', 'none')} "
+        f"detected_languages_candidates={diagnostics.get('detected_languages_candidates', [])} "
+        f"detected_languages={diagnostics['detected_languages']} "
+        f"enable_language_filter={diagnostics.get('enable_language_filter', True)} "
+        f"viking_use_detected_language={diagnostics.get('viking_use_detected_language', True)} "
+        f"viking_language_seeded={diagnostics.get('viking_language_seeded', False)} "
+        f"l0_only={diagnostics.get('l0_only', False)} "
+        f"filter_applied={diagnostics['filter_applied']} "
+        f"timeout_location={diagnostics['timeout_location']}"
+    )
+
     return metadata
 
 
@@ -216,6 +372,12 @@ class RAGRetriever:
     def __init__(self):
         self.config = src.utils.load_config()  # Use module-level for patching support
         self.db_cfg = self.config.get("database", {})
+        self.backend_mode = str(self.db_cfg.get("type", "postgres")).lower()
+        if self.backend_mode != "postgres":
+            raise ValueError(
+                f"Unsupported database.type='{self.backend_mode}'. "
+                "Current retriever backend supports postgres only."
+            )
         
         self.embedding_model_name = self.config["embedding"]["model_name"]
         configured_device = self.config.get("embedding", {}).get("device", "auto")
@@ -226,6 +388,9 @@ class RAGRetriever:
         self.reranker_model_name = self.config["reranker"]["model_name"]
         self.use_reranker = self.config["reranker"]["enabled"]
         self.top_n = self.config["reranker"]["top_n"]
+        reranker_cfg = self.config.get("reranker", {})
+        self.pre_rerank_cap = max(0, int(reranker_cfg.get("pre_rerank_cap", 300)))
+        self.rerank_max_input_chars = max(256, int(reranker_cfg.get("max_input_chars", 4000)))
         
         # Connect to DB (Lightweight, keep open)
         print("Connecting to Vector Database (PostgreSQL)...")
@@ -251,6 +416,9 @@ class RAGRetriever:
         
         # Vision and recursive retrieval config
         retrieval_cfg = self.config.get("retrieval", {})
+        self.enable_language_filter = bool(retrieval_cfg.get("enable_language_filter", True))
+        self.viking_use_detected_language = bool(retrieval_cfg.get("viking_use_detected_language", True))
+        self.l0_only = bool(retrieval_cfg.get("l0_only", False))
         self.vision_enabled = retrieval_cfg.get("vision_search", False)
         self.recursive_enabled = retrieval_cfg.get("recursive_retrieval", True)
 
@@ -343,6 +511,73 @@ class RAGRetriever:
             print(f"Viking BM25 Filter: {len(bm25_results)} → {len(filtered)}")
         return filtered
 
+    def _bm25_lang_filter(self, bm25_results, lang_filter_value):
+        """Apply metadata->>'lang' filter to BM25 results before RRF merge."""
+        if not bm25_results or not lang_filter_value:
+            return bm25_results
+
+        requested_langs = (
+            [lang_filter_value] if isinstance(lang_filter_value, str)
+            else [str(v).strip() for v in lang_filter_value if str(v).strip()]
+        )
+        if not requested_langs:
+            return bm25_results
+
+        doc_ids = [doc_id for doc_id, _ in bm25_results]
+        id_placeholders = ",".join(["%s"] * len(doc_ids))
+        lang_placeholders = ",".join(["%s"] * len(requested_langs))
+
+        query_sql = sql.SQL(
+            """
+            SELECT id FROM {}
+            WHERE id IN ({}) AND metadata->>'lang' IN ({})
+            """
+        ).format(
+            sql.Identifier(self.table_name),
+            sql.SQL(id_placeholders),
+            sql.SQL(lang_placeholders),
+        )
+        params = tuple(doc_ids + requested_langs)
+
+        valid_ids = set()
+        with self.conn.cursor() as cur:
+            cur.execute(query_sql, params)
+            for row in cur.fetchall():
+                valid_ids.add(row[0])
+
+        filtered = [(doc_id, score) for doc_id, score in bm25_results if doc_id in valid_ids]
+        if len(filtered) < len(bm25_results):
+            print(f"BM25 Lang Filter: {len(bm25_results)} → {len(filtered)} (langs={requested_langs})")
+        return filtered
+
+    def _bm25_l0_filter(self, bm25_results):
+        """Apply metadata->>'level'='0' filter to BM25 results before RRF merge."""
+        if not bm25_results:
+            return bm25_results
+
+        doc_ids = [doc_id for doc_id, _ in bm25_results]
+        id_placeholders = ",".join(["%s"] * len(doc_ids))
+        query_sql = sql.SQL(
+            """
+            SELECT id FROM {}
+            WHERE id IN ({}) AND metadata->>'level' = '0'
+            """
+        ).format(
+            sql.Identifier(self.table_name),
+            sql.SQL(id_placeholders),
+        )
+
+        valid_ids = set()
+        with self.conn.cursor() as cur:
+            cur.execute(query_sql, tuple(doc_ids))
+            for row in cur.fetchall():
+                valid_ids.add(row[0])
+
+        filtered = [(doc_id, score) for doc_id, score in bm25_results if doc_id in valid_ids]
+        if len(filtered) < len(bm25_results):
+            print(f"BM25 L0 Filter: {len(bm25_results)} → {len(filtered)}")
+        return filtered
+
     @staticmethod
     def _viking_scope_guard(docs, viking_scope, mode="soft"):
         """Post-fusion scope guard: enforce Viking path constraints on merged docs.
@@ -399,22 +634,67 @@ class RAGRetriever:
         threshold_dist = 0.55
         fetch_k = k * 3
         
+        if metadata is None:
+            metadata = {}
+        diagnostics = metadata.get("_diagnostics")
+        if not isinstance(diagnostics, dict):
+            diagnostics = {
+                "lang_detect_method": "none",
+                "detected_languages": [],
+                "detected_languages_candidates": [],
+                "lang_detect_stage": "none",
+                "enable_language_filter": self.enable_language_filter,
+                "viking_use_detected_language": self.viking_use_detected_language,
+                "viking_language_seeded": False,
+                "l0_only": self.l0_only,
+                "filter_applied": False,
+                "timeout_location": "none",
+            }
+            metadata["_diagnostics"] = diagnostics
+        diagnostics["enable_language_filter"] = self.enable_language_filter
+        diagnostics["viking_use_detected_language"] = self.viking_use_detected_language
+        diagnostics["l0_only"] = self.l0_only
+        diagnostics["filter_applied"] = False
+
         # Build language filter clause
         lang_filter = ""
         lang_param = []
-        if metadata and metadata.get('lang'):
+        if self.enable_language_filter and metadata and metadata.get('lang'):
             lang = metadata['lang']
             if isinstance(lang, list):
                 # Multi-language query - use IN clause
                 placeholders = ','.join(['%s'] * len(lang))
                 lang_filter = f" AND metadata->>'lang' IN ({placeholders})"
                 lang_param = lang
+                diagnostics["filter_applied"] = True
                 print(f"Applying Multi-Language Filter: {lang}")
             else:
                 # Single language
                 print(f"Applying Language Filter: {lang}")
                 lang_filter = " AND metadata->>'lang' = %s"
                 lang_param = [lang]
+                diagnostics["filter_applied"] = True
+        elif metadata and metadata.get("lang") and not self.enable_language_filter:
+            print("Language Filter: disabled by retrieval.enable_language_filter=false")
+
+        level_filter = ""
+        if self.l0_only:
+            level_filter = " AND metadata->>'level' = '0'"
+            print("Applying L0-only Filter: metadata.level=0")
+
+        print(
+            "LANG_FILTER_DIAGNOSTICS "
+            f"lang_detect_method={diagnostics.get('lang_detect_method', 'none')} "
+            f"lang_detect_stage={diagnostics.get('lang_detect_stage', 'none')} "
+            f"detected_languages_candidates={diagnostics.get('detected_languages_candidates', [])} "
+            f"detected_languages={diagnostics.get('detected_languages', [])} "
+            f"enable_language_filter={diagnostics.get('enable_language_filter', True)} "
+            f"viking_use_detected_language={diagnostics.get('viking_use_detected_language', True)} "
+            f"viking_language_seeded={diagnostics.get('viking_language_seeded', False)} "
+            f"l0_only={diagnostics.get('l0_only', False)} "
+            f"filter_applied={diagnostics.get('filter_applied', False)} "
+            f"timeout_location={diagnostics.get('timeout_location', 'none')}"
+        )
         
         # 1. Vector Search (with optional Viking scope filter)
         viking_filter, viking_params = self._build_viking_sql_filter(viking_scope)
@@ -430,12 +710,13 @@ class RAGRetriever:
                 """
                 SELECT id, content, metadata, (embedding <=> %s::vector) as distance
                 FROM {}
-                WHERE (embedding <=> %s::vector) < %s {} {}
+                WHERE (embedding <=> %s::vector) < %s {} {} {}
                 ORDER BY distance ASC LIMIT %s
                 """
             ).format(
                 sql.Identifier(self.table_name),
                 sql.SQL(lang_filter),
+                sql.SQL(level_filter),
                 sql.SQL(viking_filter),
             )
             vector_params = ([query_vector, query_vector, threshold_dist]
@@ -486,6 +767,10 @@ class RAGRetriever:
                 bm25_index = BM25Index(self.bm25_index_path)
                 bm25_results = bm25_index.search(query, top_k=fetch_k)
                 print(f"BM25 Search: {len(bm25_results)} matches")
+                if self.l0_only and bm25_results:
+                    bm25_results = self._bm25_l0_filter(bm25_results)
+                if self.enable_language_filter and metadata and metadata.get('lang'):
+                    bm25_results = self._bm25_lang_filter(bm25_results, metadata.get('lang'))
                 # In strict mode, pre-filter BM25 to enforce scope purity.
                 # In soft mode, skip pre-filter — let RRF merge freely;
                 # post-fusion _viking_scope_guard handles soft enforcement.
@@ -724,7 +1009,7 @@ class RAGRetriever:
             vision_retriever.initialize()
 
             # Use lang from metadata as filter
-            lang_filter = metadata.get('lang')
+            lang_filter = metadata.get('lang') if self.enable_language_filter else None
             return vision_retriever.search(query, top_k=3, lang_filter=lang_filter)
         except Exception as e:
             print(f"Vision retrieval failed: {e}")
@@ -741,25 +1026,52 @@ class RAGRetriever:
     def perform_rerank(self, query: str, docs: List[Document], top_n: int = None):
         if top_n is None:
             top_n = self.top_n
-        
+
+        original_count = len(docs)
+        candidates = docs
+
+        if self.pre_rerank_cap > 0 and len(candidates) > self.pre_rerank_cap:
+            candidates = sorted(
+                candidates,
+                key=lambda d: d.metadata.get("_vector_rank", 10**9),
+            )[:self.pre_rerank_cap]
+            print(
+                f"Pre-rerank cap applied: {original_count} -> {len(candidates)} "
+                f"(cap={self.pre_rerank_cap})"
+            )
+
         # Preserve vector top-5 (using _vector_rank metadata)
-        vector_top = [d for d in docs if d.metadata.get('_vector_rank', 999) < 5]
-            
+        vector_top = [d for d in candidates if d.metadata.get('_vector_rank', 999) < 5]
+
         print(f"Loading Reranker ({self.reranker_model_name})...")
         reranker = CrossEncoder(
             self.reranker_model_name, 
             device=self.device,
             trust_remote_code=True
         )
-        
-        pairs = [[query, doc.page_content] for doc in docs]
-        scores = reranker.predict(pairs, batch_size=4) 
+
+        pairs = []
+        truncated_count = 0
+        for doc in candidates:
+            content = doc.page_content or ""
+            if len(content) > self.rerank_max_input_chars:
+                content = content[:self.rerank_max_input_chars]
+                truncated_count += 1
+            pairs.append([query, content])
+
+        if truncated_count > 0:
+            print(
+                f"Rerank input truncation: {truncated_count}/{len(candidates)} docs "
+                f"truncated to {self.rerank_max_input_chars} chars"
+            )
+
+        scores = reranker.predict(pairs, batch_size=4)
         
         del reranker
         self._clean_memory()
         print("Reranker unloaded.")
         
-        scored_docs = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
+        scored_docs = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
         top_n_docs = [doc for doc, score in scored_docs[:top_n]]
         
         # Merge preserved vector top with reranked results
@@ -779,7 +1091,10 @@ class RAGRetriever:
             if added > 0:
                 print(f"Vector Top Preserved: {added} docs")
         
-        print(f"Reranked: Reduced from {len(docs)} to {len(top_n_docs)} docs (Top-N={top_n})")
+        print(
+            f"Reranked: Reduced from {original_count} to {len(top_n_docs)} docs "
+            f"(candidate={len(candidates)}, Top-N={top_n})"
+        )
         return top_n_docs
 
     def retrieve_documents(self, query: str, metadata: Dict[str, Any] = None, k: int = None, top_n: int = None) -> List[Document]:
@@ -804,6 +1119,25 @@ class RAGRetriever:
         else:
             metadata = {}
 
+        diagnostics = metadata.get("_diagnostics")
+        if not isinstance(diagnostics, dict):
+            diagnostics = {
+                "lang_detect_method": "none",
+                "detected_languages": [],
+                "detected_languages_candidates": [],
+                "lang_detect_stage": "none",
+                "enable_language_filter": self.enable_language_filter,
+                "viking_use_detected_language": self.viking_use_detected_language,
+                "viking_language_seeded": False,
+                "l0_only": self.l0_only,
+                "filter_applied": False,
+                "timeout_location": "none",
+            }
+            metadata["_diagnostics"] = diagnostics
+        diagnostics["enable_language_filter"] = self.enable_language_filter
+        diagnostics["viking_use_detected_language"] = self.viking_use_detected_language
+        diagnostics["l0_only"] = self.l0_only
+
         # Viking routing (search-space restriction)
         viking_scope = None
         if self.viking_enabled:
@@ -811,15 +1145,38 @@ class RAGRetriever:
             from src.retrieve.viking_index import get_taxonomy_index
             data_path = self.config["project"]["data_path"]
             tax_index = get_taxonomy_index(data_path)
-            viking_scope = compute_scope(query, metadata, tax_index)
+            viking_metadata = dict(metadata)
+            if not self.viking_use_detected_language:
+                viking_metadata.pop("lang", None)
+                viking_metadata["_viking_use_detected_language"] = False
+                diagnostics["viking_language_seeded"] = False
+            else:
+                viking_metadata["_viking_use_detected_language"] = True
+                diagnostics["viking_language_seeded"] = bool(metadata.get("lang"))
+            viking_scope = compute_scope(query, viking_metadata, tax_index)
             print(f"Viking Scope: conf={viking_scope.confidence}, "
                   f"patterns={len(viking_scope.path_patterns)}, "
                   f"trace={viking_scope.trace}")
+        else:
+            diagnostics["viking_language_seeded"] = False
 
         # 1. Text Retrieval (Sequential)
         text_docs = self.retrieve_text(query, k, metadata=metadata,
                                        viking_scope=viking_scope)
         print(f"Text Matches: {len(text_docs)}")
+        print(
+            "RETRIEVAL_DIAGNOSTICS "
+            f"lang_detect_method={diagnostics.get('lang_detect_method', 'none')} "
+            f"lang_detect_stage={diagnostics.get('lang_detect_stage', 'none')} "
+            f"detected_languages_candidates={diagnostics.get('detected_languages_candidates', [])} "
+            f"detected_languages={diagnostics.get('detected_languages', [])} "
+            f"enable_language_filter={diagnostics.get('enable_language_filter', True)} "
+            f"viking_use_detected_language={diagnostics.get('viking_use_detected_language', True)} "
+            f"viking_language_seeded={diagnostics.get('viking_language_seeded', False)} "
+            f"l0_only={diagnostics.get('l0_only', False)} "
+            f"filter_applied={diagnostics.get('filter_applied', False)} "
+            f"timeout_location={diagnostics.get('timeout_location', 'none')}"
+        )
 
         # Stamp Viking scope metadata on every doc for UI transparency
         if viking_scope:

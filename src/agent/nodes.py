@@ -1,5 +1,5 @@
 import threading
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import src.utils
 from src.agent.state import GraphState
@@ -55,6 +55,28 @@ def _get_generation_timeout_sec(default_sec: int = 60) -> int:
     except Exception:
         return default_sec
 
+
+def _is_timeout_exception(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        "timeout" in msg
+        or "read timed out" in msg
+        or "timed out" in msg
+    )
+
+
+def _append_warning(
+    warnings: List[str],
+    timeout_locations: List[str],
+    message: str,
+    timeout_location: str | None = None,
+) -> None:
+    if message not in warnings:
+        warnings.append(message)
+    if timeout_location and timeout_location not in timeout_locations:
+        timeout_locations.append(timeout_location)
+
+
 def _generate_with_timeout(query: str, context: str, timeout_sec: int) -> str:
     result = {"value": None, "error": None}
     timeout_fallback = (
@@ -95,6 +117,8 @@ def retrieve_node(state: GraphState):
     question = state["question"]
     search_count = state.get("search_count", 0)
     existing_docs = state.get("documents", []) # Accumulative
+    warnings = list(state.get("warnings", []))
+    timeout_locations = list(state.get("timeout_locations", []))
 
     # Unload LLM to free VRAM for embeddings
     try:
@@ -103,45 +127,64 @@ def retrieve_node(state: GraphState):
     except Exception:
         pass
 
-    # Dynamic Top-K scaling (3-tier)
-    # Base: 15 for normal queries
-    # Mid-broad: 30 for topic-specific linguistics queries  
-    # Super-broad: 60 for exhaustive queries (all, compare, list)
-    
-    super_broad_keywords = [
-        "모든", "목록", "전체", "list", "all", "overview", "언어들",
-        "데이터베이스", "db", "비교", "compare", "차이", "difference"
-    ]
-    
-    mid_broad_keywords = [
-        # Topic-specific linguistics terms
-        "aspect", "시상", "tense", "양태", "modality", "mood",
-        "연동", "serial", "svc", "구문", "construction",
-        "음운", "phonology", "phoneme", "자음", "모음", "vowel", "consonant",
-        "어순", "word order", "화제", "topic", "주어", "subject",
-        "격", "case", "표지", "marker", "접사", "affix",
-        "종류", "types", "features", "특징", "구조", "structure"
-    ]
-    
-    q_lower = question.lower()
-    
-    if any(kw in q_lower for kw in super_broad_keywords):
-        k, top_n = 60, 25
-        print(f"  - Dynamic Scaling: Super-broad query detected.")
-        print(f"    -> k={k}, top_n={top_n}")
-    elif any(kw in q_lower for kw in mid_broad_keywords):
-        k, top_n = 30, 15
-        print(f"  - Dynamic Scaling: Mid-broad (topic-specific) query detected.")
-        print(f"    -> k={k}, top_n={top_n}")
+    config = src.utils.load_config()
+    retrieval_cfg = config.get("retrieval", {})
+    reranker_cfg = config.get("reranker", {})
+    dynamic_scaling = bool(retrieval_cfg.get("dynamic_scaling", True))
+
+    if dynamic_scaling:
+        # Dynamic Top-K scaling (3-tier)
+        # Base: 15 for normal queries
+        # Mid-broad: 30 for topic-specific linguistics queries
+        # Super-broad: 60 for exhaustive queries (all, compare, list)
+        super_broad_keywords = [
+            "모든", "목록", "전체", "list", "all", "overview", "언어들",
+            "데이터베이스", "db", "비교", "compare", "차이", "difference"
+        ]
+
+        mid_broad_keywords = [
+            # Topic-specific linguistics terms
+            "aspect", "시상", "tense", "양태", "modality", "mood",
+            "연동", "serial", "svc", "구문", "construction",
+            "음운", "phonology", "phoneme", "자음", "모음", "vowel", "consonant",
+            "어순", "word order", "화제", "topic", "주어", "subject",
+            "격", "case", "표지", "marker", "접사", "affix",
+            "종류", "types", "features", "특징", "구조", "structure"
+        ]
+
+        q_lower = question.lower()
+
+        if any(kw in q_lower for kw in super_broad_keywords):
+            k, top_n = 60, 25
+            print("  - Dynamic Scaling: Super-broad query detected.")
+            print(f"    -> k={k}, top_n={top_n}")
+        elif any(kw in q_lower for kw in mid_broad_keywords):
+            k, top_n = 30, 15
+            print("  - Dynamic Scaling: Mid-broad (topic-specific) query detected.")
+            print(f"    -> k={k}, top_n={top_n}")
+        else:
+            k, top_n = 15, 10
+            print(f"  - Dynamic Scaling: Normal query. k={k}, top_n={top_n}")
     else:
-        k, top_n = 15, 10
-        print(f"  - Dynamic Scaling: Normal query. k={k}, top_n={top_n}")
+        k = int(retrieval_cfg.get("fixed_k", retrieval_cfg.get("k", 15)))
+        top_n = int(retrieval_cfg.get("fixed_top_n", reranker_cfg.get("top_n", 10)))
+        print(f"  - Dynamic Scaling: disabled. Using fixed k={k}, top_n={top_n}")
 
 
     with RAGRetriever() as retriever:
         # Metadata Extraction Logic (New)
         print("  - Analyzing Query Metadata...")
         metadata = extract_query_metadata(question, retriever.config)
+        retrieval_diagnostics = metadata.get("_diagnostics", {})
+        timeout_loc = retrieval_diagnostics.get("timeout_location", "none")
+        if timeout_loc != "none":
+            print(f"TIMEOUT_DIAGNOSTIC timeout_location={timeout_loc}")
+            _append_warning(
+                warnings,
+                timeout_locations,
+                f"Language detection timeout at {timeout_loc}; proceeding without language filter.",
+                timeout_loc,
+            )
 
         new_docs = retriever.retrieve_documents(question, k=k, top_n=top_n, metadata=metadata)
     
@@ -158,7 +201,14 @@ def retrieve_node(state: GraphState):
 
     print(f"  - Total Documents (Accumulated): {len(combined_docs)}")
     
-    return {"documents": combined_docs, "question": question, "search_count": search_count}
+    return {
+        "documents": combined_docs,
+        "question": question,
+        "search_count": search_count,
+        "warnings": warnings,
+        "timeout_locations": timeout_locations,
+        "retrieval_diagnostics": retrieval_diagnostics,
+    }
 
 def grade_documents_node(state: GraphState):
     """
@@ -167,14 +217,40 @@ def grade_documents_node(state: GraphState):
     print("---CHECK DOCUMENT RELEVANCE---")
     question = state["question"]
     documents = state["documents"]
+    warnings = list(state.get("warnings", []))
+    timeout_locations = list(state.get("timeout_locations", []))
 
     # Skip grading if disabled via config
     config = src.utils.load_config()
     if config.get("rag", {}).get("skip_grading", False):
         print("---SKIP DOCUMENT GRADING (disabled)---")
-        return {"documents": documents, "question": question}
+        return {
+            "documents": documents,
+            "question": question,
+            "warnings": warnings,
+            "timeout_locations": timeout_locations,
+        }
 
-    grader = get_grade_chain()
+    try:
+        grader = get_grade_chain()
+    except Exception as e:
+        timeout_location = "grade_documents"
+        print(f"  - Grader init failed. Fail-open mode: {e}")
+        if _is_timeout_exception(e):
+            print(f"TIMEOUT_DIAGNOSTIC timeout_location={timeout_location}")
+        _append_warning(
+            warnings,
+            timeout_locations,
+            f"Document grading failed at {timeout_location}; all documents retained.",
+            timeout_location,
+        )
+        return {
+            "documents": documents,
+            "question": question,
+            "warnings": warnings,
+            "timeout_locations": timeout_locations,
+        }
+
     filtered_docs = []
     
     relevance_count = 0
@@ -188,7 +264,21 @@ def grade_documents_node(state: GraphState):
             f"{d.page_content}"
         )
         
-        score = grader.invoke({"question": question, "document": rich_content})
+        try:
+            score = grader.invoke({"question": question, "document": rich_content})
+        except Exception as e:
+            timeout_location = "grade_documents"
+            print(f"  - Grading failed for {d.metadata.get('ref_id')}. Fail-open keep doc: {e}")
+            if _is_timeout_exception(e):
+                print(f"TIMEOUT_DIAGNOSTIC timeout_location={timeout_location}")
+            _append_warning(
+                warnings,
+                timeout_locations,
+                f"Document grading timeout/error at {timeout_location}; fail-open applied.",
+                timeout_location,
+            )
+            filtered_docs.append(d)
+            continue
         
         # Robust parsing for string output
         grade = str(score).lower().strip()
@@ -201,7 +291,12 @@ def grade_documents_node(state: GraphState):
             print(f"  - GRADED DOCUMENT: NOT RELEVANT ({d.metadata.get('ref_id')})")
             continue
             
-    return {"documents": filtered_docs, "question": question}
+    return {
+        "documents": filtered_docs,
+        "question": question,
+        "warnings": warnings,
+        "timeout_locations": timeout_locations,
+    }
 
 def generate_node(state: GraphState):
     """
@@ -210,6 +305,8 @@ def generate_node(state: GraphState):
     print("---GENERATE---")
     question = state["question"]
     documents = state["documents"]
+    warnings = list(state.get("warnings", []))
+    timeout_locations = list(state.get("timeout_locations", []))
     
     # Format Context
     text_context_lines = []
@@ -239,7 +336,13 @@ def generate_node(state: GraphState):
 
     timeout_sec = _get_generation_timeout_sec(default_sec=60)
     generation = _generate_with_timeout(query=question, context=context_str, timeout_sec=timeout_sec)
-    return {"documents": documents, "question": question, "generation": generation}
+    return {
+        "documents": documents,
+        "question": question,
+        "generation": generation,
+        "warnings": warnings,
+        "timeout_locations": timeout_locations,
+    }
 
 def check_hallucination_node(state: GraphState):
     """
@@ -249,12 +352,20 @@ def check_hallucination_node(state: GraphState):
     question = state["question"]
     documents = state["documents"]
     generation = state["generation"]
+    warnings = list(state.get("warnings", []))
+    timeout_locations = list(state.get("timeout_locations", []))
 
     # Skip hallucination check if disabled via config
     config = src.utils.load_config()
     if config.get("rag", {}).get("skip_hallucination", False):
         print("---SKIP HALLUCINATION CHECK (disabled)---")
-        return {"documents": documents, "generation": generation, "hallucination_status": "pass"}
+        return {
+            "documents": documents,
+            "generation": generation,
+            "hallucination_status": "pass",
+            "warnings": warnings,
+            "timeout_locations": timeout_locations,
+        }
 
     checker = get_hallucination_chain()
     
@@ -270,25 +381,73 @@ def check_hallucination_node(state: GraphState):
     refusal_keywords = ["정보가 부족", "알 수 없습니다", "문맥에 나타나 있지 않으", "제공된 문맥", "information is missing"]
     if any(k in generation for k in refusal_keywords):
         print("  - DECISION: GROUNDED REFUSAL (Pass)")
-        return {"documents": documents, "generation": generation, "hallucination_status": "pass"}
-    
-    score = checker.invoke({"documents": docs_text, "generation": generation})
+        return {
+            "documents": documents,
+            "generation": generation,
+            "hallucination_status": "pass",
+            "warnings": warnings,
+            "timeout_locations": timeout_locations,
+        }
+
+    try:
+        score = checker.invoke({"documents": docs_text, "generation": generation})
+    except Exception as e:
+        timeout_location = "hallucination_check"
+        print(f"  - Hallucination check failed. Fail-open pass-with-warning: {e}")
+        if _is_timeout_exception(e):
+            print(f"TIMEOUT_DIAGNOSTIC timeout_location={timeout_location}")
+        _append_warning(
+            warnings,
+            timeout_locations,
+            f"Hallucination check timeout/error at {timeout_location}; fail-open applied.",
+            timeout_location,
+        )
+        warning_msg = (
+            "\n\n> [!WARNING] (Runtime): Hallucination check timed out/failed. "
+            "Answer is returned in fail-open mode."
+        )
+        return {
+            "documents": documents,
+            "generation": generation + warning_msg,
+            "hallucination_status": "pass",
+            "warnings": warnings,
+            "timeout_locations": timeout_locations,
+        }
+
     grade = str(score).lower().strip()
     
     # Tiered Logic
     if "yes" in grade:
         print("  - DECISION: GROUNDED (Pass)")
-        return {"documents": documents, "generation": generation, "hallucination_status": "pass"}
+        return {
+            "documents": documents,
+            "generation": generation,
+            "hallucination_status": "pass",
+            "warnings": warnings,
+            "timeout_locations": timeout_locations,
+        }
         
     elif "ambiguous" in grade:
         print("  - DECISION: AMBIGUOUS -> PASS WITH WARNING")
         warning_msg = "\n\n> [!WARNING] (Uncertainty): This answer is based on inference or partial information. Please verify specific details."
         new_generation = generation + warning_msg
-        return {"documents": documents, "generation": new_generation, "hallucination_status": "pass"}
+        return {
+            "documents": documents,
+            "generation": new_generation,
+            "hallucination_status": "pass",
+            "warnings": warnings,
+            "timeout_locations": timeout_locations,
+        }
         
     else:
         print("  - DECISION: HALLUCINATION DETECTED (Fail)")
-        return {"documents": documents, "generation": generation, "hallucination_status": "fail"}
+        return {
+            "documents": documents,
+            "generation": generation,
+            "hallucination_status": "fail",
+            "warnings": warnings,
+            "timeout_locations": timeout_locations,
+        }
 
 
 def rewrite_query_node(state: GraphState):
@@ -299,11 +458,32 @@ def rewrite_query_node(state: GraphState):
     question = state["question"]
     documents = state["documents"]
     search_count = state.get("search_count", 0)
-    
-    rewriter = get_rewrite_chain()
-    better_question = rewriter.invoke({"question": question})
+    warnings = list(state.get("warnings", []))
+    timeout_locations = list(state.get("timeout_locations", []))
+
+    better_question = question
+    try:
+        rewriter = get_rewrite_chain()
+        better_question = rewriter.invoke({"question": question})
+    except Exception as e:
+        timeout_location = "rewrite_query"
+        print(f"  - Rewrite failed. Fail-open keep original query: {e}")
+        if _is_timeout_exception(e):
+            print(f"TIMEOUT_DIAGNOSTIC timeout_location={timeout_location}")
+        _append_warning(
+            warnings,
+            timeout_locations,
+            f"Rewrite timeout/error at {timeout_location}; original query retained.",
+            timeout_location,
+        )
     
     print(f"  - Old Query: {question}")
     print(f"  - New Query: {better_question}")
     
-    return {"documents": documents, "question": better_question, "search_count": search_count + 1}
+    return {
+        "documents": documents,
+        "question": better_question,
+        "search_count": search_count + 1,
+        "warnings": warnings,
+        "timeout_locations": timeout_locations,
+    }
