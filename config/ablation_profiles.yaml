@@ -2,12 +2,17 @@ defaults:
   retrieval:
     dynamic_scaling: false
     fixed_k: 30
-    fixed_top_n: 15
+    fixed_top_n: 30
     l0_only: true
     enable_language_filter: false
     viking_use_detected_language: false
     recursive_retrieval: false
+    sibling_expansion: false
     vision_search: false
+    query_split:
+      enabled: false
+      max_languages: 3
+      branch_k_mode: balanced
     hybrid_search:
       enabled: false
     viking:
@@ -16,50 +21,52 @@ defaults:
       max_expansions: 2
       min_hits: 3
   reranker:
-    enabled: true
+    enabled: false
+    top_n: 30
   ablation:
     enabled: true
     force_deterministic: true
     reranker_policy: follow_profile
     required_backend_mode: postgres
     profile_timeout_sec: 600
+    run_mode: retrieval
+  rag:
+    skip_grading: true
+    skip_hallucination: true
 
 profiles:
-  E0:
-    description: "Baseline simple RAG: vector-only, L0-only, no BM25, no Viking, no language filter, no recursive."
+  B0:
+    description: "Dense only baseline (vector-only, L0-only, no BM25, no Viking, no lang filter, no recursive)."
 
-  E1:
-    description: "E0 + BM25 hybrid."
+  B1:
+    description: "B0 + BM25 hybrid."
     retrieval:
       hybrid_search:
         enabled: true
 
-  E2:
-    description: "E0 + RAPTOR (L1 retrieval + recursive L1->L0 expansion)."
+  B2:
+    description: "B1 + RAPTOR recursive (L1 retrieval + L1->L0 expansion)."
     retrieval:
       l0_only: false
       recursive_retrieval: true
+      hybrid_search:
+        enabled: true
 
-  E3:
-    description: "E0 + Viking soft, language-agnostic (no SQL lang filter, no Viking language seed)."
+  B3:
+    description: "B2 + Viking soft (language-agnostic; no language filter, no Viking language seed)."
     retrieval:
+      l0_only: false
+      recursive_retrieval: true
+      hybrid_search:
+        enabled: true
       viking:
         enabled: true
         mode: soft
       enable_language_filter: false
       viking_use_detected_language: false
 
-  E4:
-    description: "E3 + language filter (and Viking language seed enabled)."
-    retrieval:
-      viking:
-        enabled: true
-        mode: soft
-      enable_language_filter: true
-      viking_use_detected_language: true
-
-  E5:
-    description: "All mixed: BM25 + RAPTOR + Viking soft + language filter."
+  B4:
+    description: "B3 + language filter (and Viking language seed enabled)."
     retrieval:
       l0_only: false
       recursive_retrieval: true
@@ -70,3 +77,67 @@ profiles:
         mode: soft
       enable_language_filter: true
       viking_use_detected_language: true
+
+  B5:
+    description: "B4 + split-query retrieval for multi-language queries."
+    retrieval:
+      l0_only: false
+      recursive_retrieval: true
+      hybrid_search:
+        enabled: true
+      viking:
+        enabled: true
+        mode: soft
+      enable_language_filter: true
+      viking_use_detected_language: true
+      query_split:
+        enabled: true
+        max_languages: 3
+        branch_k_mode: balanced
+
+  B6:
+    description: "B5 + reranker."
+    retrieval:
+      l0_only: false
+      recursive_retrieval: true
+      hybrid_search:
+        enabled: true
+      viking:
+        enabled: true
+        mode: soft
+      enable_language_filter: true
+      viking_use_detected_language: true
+      query_split:
+        enabled: true
+        max_languages: 3
+        branch_k_mode: balanced
+      fixed_top_n: 30
+    reranker:
+      enabled: true
+      top_n: 30
+
+  B7:
+    description: "B6 + LangGraph E2E loop (grade/rewrite/hallucination)."
+    retrieval:
+      l0_only: false
+      recursive_retrieval: true
+      hybrid_search:
+        enabled: true
+      viking:
+        enabled: true
+        mode: soft
+      enable_language_filter: true
+      viking_use_detected_language: true
+      query_split:
+        enabled: true
+        max_languages: 3
+        branch_k_mode: balanced
+      fixed_top_n: 30
+    reranker:
+      enabled: true
+      top_n: 30
+    rag:
+      skip_grading: false
+      skip_hallucination: false
+    ablation:
+      run_mode: e2e

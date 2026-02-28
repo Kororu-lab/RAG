@@ -6,6 +6,7 @@ import sys
 import os
 import io
 from typing import Optional, Tuple
+from streamlit.errors import NoSessionContext
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, "../.."))
@@ -14,6 +15,7 @@ if project_root not in sys.path:
 
 from src.agent.service import run_query_stream
 from src.ui.model_options import DEFAULT_MODEL, MODEL_OPTIONS
+from src.ui.runtime_config import apply_runtime_overrides
 
 LTDB_ROOT = os.path.abspath(os.path.join(project_root, "data", "ltdb"))
 # Kept as a dedicated variable for easy future extension (e.g., graded docs mode).
@@ -90,9 +92,33 @@ with st.sidebar:
     bm25_enabled = st.checkbox("BM25 Hybrid Search", value=True)
     reranker_enabled = st.checkbox("Reranker", value=True)
     recursive_enabled = st.checkbox("Recursive Retrieval", value=True)
+    sibling_expansion_enabled = st.checkbox("Sibling Expansion", value=False)
     vision_enabled = st.checkbox("Vision Search", value=False)
-    generation_timeout_sec = st.number_input("Generation Timeout (sec)", min_value=10, max_value=600, value=60, step=5)
+    generation_timeout_sec = st.number_input(
+        "LLM Timeout (sec, retrieval+generation)",
+        min_value=10,
+        max_value=600,
+        value=600,
+        step=5,
+    )
     show_original_html = st.checkbox("Show Original HTML for Retrieved Refs", value=True)
+
+    st.subheader("Split Query Retrieval")
+    query_split_enabled = st.checkbox("Split Query (Multi-language)", value=True)
+    query_split_max_languages = st.number_input(
+        "Split Max Languages",
+        min_value=2,
+        max_value=6,
+        value=3,
+        step=1,
+        disabled=not query_split_enabled,
+    )
+    query_split_branch_k_mode = st.selectbox(
+        "Split Branch K Mode",
+        options=["balanced", "full_per_branch"],
+        index=1,
+        disabled=not query_split_enabled,
+    )
 
     st.subheader("Viking Routing")
     viking_enabled = st.checkbox("Viking Routing", value=False)
@@ -106,33 +132,26 @@ with st.sidebar:
     st.divider()
     
     def build_runtime_config():
-        config = src.utils.load_config()
-
-        # Model override
-        config.setdefault("llm_retrieval", {})["model_name"] = selected_model
-        if "llm" in config:
-            config["llm"]["model_name"] = selected_model
-
-        # Retrieval settings override
-        retrieval = config.setdefault("retrieval", {})
-        retrieval.setdefault("hybrid_search", {})["enabled"] = bm25_enabled
-        retrieval["recursive_retrieval"] = recursive_enabled
-        retrieval["vision_search"] = vision_enabled
-
-        # Viking routing override
-        viking = retrieval.setdefault("viking", {})
-        viking["enabled"] = viking_enabled
-        viking["mode"] = "soft" if viking_soft else "strict"
-        viking["max_expansions"] = int(viking_max_exp)
-
-        # Reranker override
-        config.setdefault("reranker", {})["enabled"] = reranker_enabled
-        rag = config.setdefault("rag", {})
-        rag["generation_timeout_sec"] = int(generation_timeout_sec)
-        rag["skip_grading"] = not grading_enabled
-        rag["skip_hallucination"] = not hallucination_check_enabled
-
-        return config
+        base_config = src.utils.load_config()
+        return apply_runtime_overrides(
+            base_config,
+            selected_model=selected_model,
+            bm25_enabled=bm25_enabled,
+            reranker_enabled=reranker_enabled,
+            recursive_enabled=recursive_enabled,
+            vision_enabled=vision_enabled,
+            sibling_expansion_enabled=sibling_expansion_enabled,
+            query_split_enabled=query_split_enabled,
+            query_split_max_languages=int(query_split_max_languages),
+            query_split_branch_k_mode=query_split_branch_k_mode,
+            viking_enabled=viking_enabled,
+            viking_soft=viking_soft,
+            viking_max_exp=int(viking_max_exp),
+            retrieval_llm_timeout_sec=int(generation_timeout_sec),
+            generation_timeout_sec=int(generation_timeout_sec),
+            grading_enabled=grading_enabled,
+            hallucination_check_enabled=hallucination_check_enabled,
+        )
     
     st.header("Status")
     st.success("System Ready")
@@ -157,7 +176,11 @@ class StreamlitLogger:
     def write(self, message):
         self.original_stdout.write(message)
         self.log_buffer.write(message)
-        self.placeholder.code(self.log_buffer.getvalue(), language="text")
+        try:
+            self.placeholder.code(self.log_buffer.getvalue(), language="text")
+        except NoSessionContext:
+            # Ignore background-thread or late writes when session context is unavailable.
+            pass
 
     def flush(self):
         self.original_stdout.flush()

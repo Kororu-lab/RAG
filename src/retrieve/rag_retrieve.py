@@ -11,7 +11,6 @@ import argparse
 import psycopg2
 from psycopg2 import sql
 import time
-import re
 from typing import List, Dict, Any
 from copy import deepcopy
 from langchain_core.documents import Document
@@ -22,6 +21,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 from src.llm.factory import get_llm
+from src.llm.json_retry import repair_json_text
 import src.utils  # Module import for dynamic patching support
 from src.utils import LLMUtility
 from src.retrieve.language_cards import build_language_cards
@@ -39,7 +39,13 @@ except ImportError as e:
     print(f"BM25 not available: {e}")
     BM25_AVAILABLE = False
 
-def parse_detected_languages(result: str, known_languages: List[str], max_languages: int = 3) -> Any:
+def parse_detected_languages(
+    result: str,
+    known_languages: List[str],
+    max_languages: int = 3,
+    *,
+    return_json_valid: bool = False,
+) -> Any:
     """
     Parse LLM detector output strictly as JSON and validate against allowed IDs.
     No alias, pattern, or heuristic matching is used.
@@ -47,26 +53,13 @@ def parse_detected_languages(result: str, known_languages: List[str], max_langua
     known_languages_lookup = {lang.lower(): lang for lang in known_languages}
     normalized = (result or "").strip()
     if normalized.lower() in {"", "none", "null"}:
-        return None
+        return (None, True) if return_json_valid else None
 
-    def _parse_json_payload(text: str):
-        candidates = [text]
-        fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, flags=re.IGNORECASE)
-        if fence_match:
-            candidates.insert(0, fence_match.group(1).strip())
+    try:
+        structured = json.loads(normalized)
+    except Exception:
+        return (None, False) if return_json_valid else None
 
-        bracket_match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", text)
-        if bracket_match:
-            candidates.append(bracket_match.group(1).strip())
-
-        for candidate in candidates:
-            try:
-                return json.loads(candidate)
-            except Exception:
-                continue
-        return None
-
-    structured = _parse_json_payload(normalized)
     candidates: List[str] = []
     if isinstance(structured, dict):
         values = structured.get("languages", [])
@@ -76,9 +69,11 @@ def parse_detected_languages(result: str, known_languages: List[str], max_langua
             candidates = [str(v).strip() for v in values if str(v).strip()]
     elif isinstance(structured, list):
         candidates = [str(v).strip() for v in structured if str(v).strip()]
+    else:
+        return (None, True) if return_json_valid else None
 
     if not candidates:
-        return None
+        return (None, True) if return_json_valid else None
 
     detected_langs: List[str] = []
     for candidate in candidates:
@@ -88,12 +83,14 @@ def parse_detected_languages(result: str, known_languages: List[str], max_langua
 
     detected_langs = list(dict.fromkeys(detected_langs))
     if len(detected_langs) == 1:
-        return detected_langs[0]
+        parsed_value: Any = detected_langs[0]
+        return (parsed_value, True) if return_json_valid else parsed_value
     if 2 <= len(detected_langs) <= max_languages:
-        return detected_langs
+        parsed_value = detected_langs
+        return (parsed_value, True) if return_json_valid else parsed_value
     if len(detected_langs) > max_languages:
         print(f"Multi-language query: {len(detected_langs)} languages, disabling filter")
-    return None
+    return (None, True) if return_json_valid else None
 
 
 def _as_lang_list(value: Any) -> List[str]:
@@ -161,6 +158,12 @@ def extract_query_metadata(query: str, config: Dict[str, Any]) -> Dict[str, Any]
         "detected_languages": [],
         "detected_languages_candidates": [],
         "lang_detect_stage": "none",
+        "lang_json_retry_count": 0,
+        "lang_json_valid_stage_a": False,
+        "lang_json_valid_stage_b": False,
+        "lang_json_fail_open": False,
+        "split_applied": False,
+        "split_branches": [],
         "enable_language_filter": bool(retrieval_cfg.get("enable_language_filter", True)),
         "viking_use_detected_language": bool(retrieval_cfg.get("viking_use_detected_language", True)),
         "viking_language_seeded": False,
@@ -199,6 +202,14 @@ def extract_query_metadata(query: str, config: Dict[str, Any]) -> Dict[str, Any]
     lang_detect_global_card_chars = _coerce_numeric(
         llm_cfg.get("lang_detect_global_card_chars", 90), default=90, minimum=60
     )
+    lang_json_retries = _coerce_numeric(llm_cfg.get("lang_json_retries", 1), default=1, minimum=0)
+    lang_json_backoff_sec = _coerce_float(
+        llm_cfg.get("lang_json_backoff_sec", 0.25), default=0.25, minimum=0.0
+    )
+
+    def _mark_timeout(location: str) -> None:
+        if diagnostics.get("timeout_location", "none") == "none":
+            diagnostics["timeout_location"] = location
 
     try:
         if not known_languages:
@@ -260,15 +271,44 @@ JSON:"""
         diagnostics["lang_detect_stage"] = "stage_a"
         print(f"LLM Detected Language (stage_a): {stage_a_result}")
 
-        stage_a_parsed = parse_detected_languages(
+        stage_a_parsed, stage_a_json_valid = parse_detected_languages(
             stage_a_result,
             known_languages,
             max_languages=lang_detect_candidate_k,
+            return_json_valid=True,
         )
+        diagnostics["lang_json_valid_stage_a"] = bool(stage_a_json_valid)
+        json_fail_open = False
+        if not stage_a_json_valid:
+            repaired_stage_a, retries_used, repaired_ok = repair_json_text(
+                llm=llm,
+                raw_text=stage_a_result,
+                schema_hint='{"languages": ["lang_id_1", "lang_id_2"]}',
+                retries=lang_json_retries,
+                backoff_sec=lang_json_backoff_sec,
+                timeout_checker=_is_timeout_exception,
+                on_timeout=_mark_timeout,
+                timeout_location="metadata_detection_stage_a_json_repair",
+            )
+            diagnostics["lang_json_retry_count"] += retries_used
+            if repaired_ok:
+                stage_a_parsed, stage_a_json_valid = parse_detected_languages(
+                    repaired_stage_a,
+                    known_languages,
+                    max_languages=lang_detect_candidate_k,
+                    return_json_valid=True,
+                )
+                diagnostics["lang_json_valid_stage_a"] = bool(stage_a_json_valid)
+            else:
+                stage_a_parsed = None
+                diagnostics["lang_json_valid_stage_a"] = False
+                json_fail_open = True
+
         candidate_langs = _as_lang_list(stage_a_parsed)
         diagnostics["detected_languages_candidates"] = candidate_langs
 
         final_parsed = None
+        stage_b_json_failed = False
         if candidate_langs:
             language_cards = build_language_cards(
                 doc_dir,
@@ -318,9 +358,42 @@ JSON:"""
             )
             diagnostics["lang_detect_stage"] = "stage_b"
             print(f"LLM Detected Language (stage_b): {stage_b_result}")
-            final_parsed = parse_detected_languages(stage_b_result, known_languages, max_languages=3)
+            final_parsed, stage_b_json_valid = parse_detected_languages(
+                stage_b_result,
+                known_languages,
+                max_languages=3,
+                return_json_valid=True,
+            )
+            diagnostics["lang_json_valid_stage_b"] = bool(stage_b_json_valid)
+            if not stage_b_json_valid:
+                repaired_stage_b, retries_used, repaired_ok = repair_json_text(
+                    llm=llm,
+                    raw_text=stage_b_result,
+                    schema_hint='{"languages": ["lang_id_1", "lang_id_2"]}',
+                    retries=lang_json_retries,
+                    backoff_sec=lang_json_backoff_sec,
+                    timeout_checker=_is_timeout_exception,
+                    on_timeout=_mark_timeout,
+                    timeout_location="metadata_detection_stage_b_json_repair",
+                )
+                diagnostics["lang_json_retry_count"] += retries_used
+                if repaired_ok:
+                    final_parsed, stage_b_json_valid = parse_detected_languages(
+                        repaired_stage_b,
+                        known_languages,
+                        max_languages=3,
+                        return_json_valid=True,
+                    )
+                    diagnostics["lang_json_valid_stage_b"] = bool(stage_b_json_valid)
+                else:
+                    final_parsed = None
+                    stage_b_json_failed = True
+                    json_fail_open = True
+                    diagnostics["lang_json_valid_stage_b"] = False
+        else:
+            diagnostics["lang_json_valid_stage_b"] = False
 
-        if final_parsed is None and 1 <= len(candidate_langs) <= 3:
+        if final_parsed is None and 1 <= len(candidate_langs) <= 3 and not stage_b_json_failed and not json_fail_open:
             final_parsed = candidate_langs if len(candidate_langs) > 1 else candidate_langs[0]
 
         if isinstance(final_parsed, str):
@@ -328,6 +401,8 @@ JSON:"""
         elif isinstance(final_parsed, list):
             diagnostics["detected_languages"] = final_parsed
             print(f"Multi-language query detected: {final_parsed}")
+        if json_fail_open and final_parsed is None:
+            diagnostics["lang_json_fail_open"] = True
         metadata["lang"] = final_parsed
     except ValueError as e:
         if str(e) != "known_languages_empty":
@@ -355,8 +430,14 @@ JSON:"""
         "LANG_DETECT_DIAGNOSTICS "
         f"lang_detect_method={diagnostics['lang_detect_method']} "
         f"lang_detect_stage={diagnostics.get('lang_detect_stage', 'none')} "
+        f"lang_json_retry_count={diagnostics.get('lang_json_retry_count', 0)} "
+        f"lang_json_valid_stage_a={diagnostics.get('lang_json_valid_stage_a', False)} "
+        f"lang_json_valid_stage_b={diagnostics.get('lang_json_valid_stage_b', False)} "
+        f"lang_json_fail_open={diagnostics.get('lang_json_fail_open', False)} "
         f"detected_languages_candidates={diagnostics.get('detected_languages_candidates', [])} "
         f"detected_languages={diagnostics['detected_languages']} "
+        f"split_applied={diagnostics.get('split_applied', False)} "
+        f"split_branches={diagnostics.get('split_branches', [])} "
         f"enable_language_filter={diagnostics.get('enable_language_filter', True)} "
         f"viking_use_detected_language={diagnostics.get('viking_use_detected_language', True)} "
         f"viking_language_seeded={diagnostics.get('viking_language_seeded', False)} "
@@ -421,6 +502,7 @@ class RAGRetriever:
         self.l0_only = bool(retrieval_cfg.get("l0_only", False))
         self.vision_enabled = retrieval_cfg.get("vision_search", False)
         self.recursive_enabled = retrieval_cfg.get("recursive_retrieval", True)
+        self.sibling_expansion = bool(retrieval_cfg.get("sibling_expansion", False))
 
         # Viking routing config
         viking_cfg = retrieval_cfg.get("viking", {})
@@ -643,6 +725,8 @@ class RAGRetriever:
                 "detected_languages": [],
                 "detected_languages_candidates": [],
                 "lang_detect_stage": "none",
+                "split_applied": False,
+                "split_branches": [],
                 "enable_language_filter": self.enable_language_filter,
                 "viking_use_detected_language": self.viking_use_detected_language,
                 "viking_language_seeded": False,
@@ -686,8 +770,14 @@ class RAGRetriever:
             "LANG_FILTER_DIAGNOSTICS "
             f"lang_detect_method={diagnostics.get('lang_detect_method', 'none')} "
             f"lang_detect_stage={diagnostics.get('lang_detect_stage', 'none')} "
+            f"lang_json_retry_count={diagnostics.get('lang_json_retry_count', 0)} "
+            f"lang_json_valid_stage_a={diagnostics.get('lang_json_valid_stage_a', False)} "
+            f"lang_json_valid_stage_b={diagnostics.get('lang_json_valid_stage_b', False)} "
+            f"lang_json_fail_open={diagnostics.get('lang_json_fail_open', False)} "
             f"detected_languages_candidates={diagnostics.get('detected_languages_candidates', [])} "
             f"detected_languages={diagnostics.get('detected_languages', [])} "
+            f"split_applied={diagnostics.get('split_applied', False)} "
+            f"split_branches={diagnostics.get('split_branches', [])} "
             f"enable_language_filter={diagnostics.get('enable_language_filter', True)} "
             f"viking_use_detected_language={diagnostics.get('viking_use_detected_language', True)} "
             f"viking_language_seeded={diagnostics.get('viking_language_seeded', False)} "
@@ -1168,8 +1258,14 @@ class RAGRetriever:
             "RETRIEVAL_DIAGNOSTICS "
             f"lang_detect_method={diagnostics.get('lang_detect_method', 'none')} "
             f"lang_detect_stage={diagnostics.get('lang_detect_stage', 'none')} "
+            f"lang_json_retry_count={diagnostics.get('lang_json_retry_count', 0)} "
+            f"lang_json_valid_stage_a={diagnostics.get('lang_json_valid_stage_a', False)} "
+            f"lang_json_valid_stage_b={diagnostics.get('lang_json_valid_stage_b', False)} "
+            f"lang_json_fail_open={diagnostics.get('lang_json_fail_open', False)} "
             f"detected_languages_candidates={diagnostics.get('detected_languages_candidates', [])} "
             f"detected_languages={diagnostics.get('detected_languages', [])} "
+            f"split_applied={diagnostics.get('split_applied', False)} "
+            f"split_branches={diagnostics.get('split_branches', [])} "
             f"enable_language_filter={diagnostics.get('enable_language_filter', True)} "
             f"viking_use_detected_language={diagnostics.get('viking_use_detected_language', True)} "
             f"viking_language_seeded={diagnostics.get('viking_language_seeded', False)} "
@@ -1216,8 +1312,9 @@ class RAGRetriever:
         if self.use_reranker and text_docs:
             print("Reranking text docs...")
             text_docs = self.perform_rerank(query, text_docs, top_n=top_n)
-            # Expand sibling chunks for docs where only chunk:0 (title) was selected
-            text_docs = self._expand_sibling_chunks(text_docs)
+            if self.sibling_expansion:
+                # Optional sibling expansion (disabled by default for ablations)
+                text_docs = self._expand_sibling_chunks(text_docs)
 
         # Merge Text and Vision
         final_docs = text_docs + vision_docs

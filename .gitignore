@@ -3,8 +3,7 @@
 *.json
 data/*
 !data/README.md
-corrupt_samples/*
-!corrupt_samples/README.md
+tests/*
 
 # Config files
 config.yaml
@@ -21,3 +20,7 @@ AGENTS.md
 CLAUDE.md
 reports/*
 results/*
+
+# Eval harness outputs
+eval/runs/*
+!eval/runs/.gitkeep

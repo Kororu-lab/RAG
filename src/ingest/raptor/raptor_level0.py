@@ -3,7 +3,7 @@ import sys
 import glob
 import json
 import re
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
@@ -21,8 +21,50 @@ DB_PATH = CONFIG["project"]["db_path"]
 llm_cfg = CONFIG.get("llm_ingestion", CONFIG.get("llm", {}))
 LLM_MODEL = llm_cfg.get("model_name")
 BASE_URL = llm_cfg.get("base_url")
+ingest_l0_cfg = (CONFIG.get("ingest", {}) or {}).get("l0", {}) or {}
+MIN_CONTENT_CHARS = int(ingest_l0_cfg.get("min_content_chars", 10))
+ALLOW_SHORT_STUB = bool(ingest_l0_cfg.get("allow_short_stub", False))
 
-from bs4 import BeautifulSoup, NavigableString
+
+def _normalize_space(text: str) -> str:
+    return " ".join((text or "").split()).strip()
+
+
+def _finalize_section_content(header: str, content: str) -> str:
+    """
+    Ensure short/sparse sections retain enough lexical signal by including header text.
+    """
+    header_text = _normalize_space(header)
+    content_text = _normalize_space(content)
+
+    if not content_text:
+        return header_text
+    if not header_text:
+        return content_text
+    if len(content_text) < MIN_CONTENT_CHARS and header_text not in content_text:
+        return _normalize_space(f"{header_text} {content_text}")
+    return content_text
+
+
+def _build_header_fallback(soup: BeautifulSoup):
+    if not soup.body:
+        return []
+
+    headers = []
+    for tag in soup.body.find_all(["h1", "h2", "h3"]):
+        text = _normalize_space(tag.get_text(" ", strip=True))
+        if text:
+            headers.append(text)
+
+    if headers:
+        unique_headers = list(dict.fromkeys(headers))
+        merged = _normalize_space(" ".join(unique_headers))
+        return [(unique_headers[0], merged)]
+
+    body_text = _normalize_space(soup.body.get_text(" ", strip=True))
+    if body_text:
+        return [("BodyFallback", body_text)]
+    return []
 
 def parse_html_sections(file_path):
     """
@@ -50,7 +92,9 @@ def parse_html_sections(file_path):
             if element.name in ["h1", "h2", "h3"]:
                 # Save previous section if it has content
                 if current_content:
-                    sections.append((current_header, " ".join(current_content).strip()))
+                    section_text = _finalize_section_content(current_header, " ".join(current_content))
+                    if section_text:
+                        sections.append((current_header, section_text))
                     current_content = []
                 current_header = element.get_text(strip=True)
             
@@ -64,7 +108,12 @@ def parse_html_sections(file_path):
     
     # Append the last section
     if current_content:
-        sections.append((current_header, " ".join(current_content).strip()))
+        section_text = _finalize_section_content(current_header, " ".join(current_content))
+        if section_text:
+            sections.append((current_header, section_text))
+
+    if not sections:
+        sections = _build_header_fallback(soup)
 
     return sections
 
@@ -196,14 +245,21 @@ def process_file(file_path, llm):
         content = raw_content.replace("ERROR: no translation line", "").strip()
         content_len = len(content)
 
-        if content_len < 10:
-            continue  # Noise
+        if content_len == 0:
+            continue  # Empty noise
+
+        is_short_stub = content_len < MIN_CONTENT_CHARS
+        if is_short_stub and not ALLOW_SHORT_STUB:
+            continue
         
         summary = ""
         keywords = ""
         node_type = "L0_base"
         
-        if 10 <= content_len < 100:
+        if is_short_stub:
+            summary = " ".join(content.split())
+            keywords = "[Auto-Stub: Short Text]"
+        elif content_len < 100:
             # Bypass LLM
             summary = content.strip()
             summary = " ".join(summary.split())
@@ -224,7 +280,7 @@ def process_file(file_path, llm):
             if "Validation Failed" in summary:
                 keywords = "error"
 
-        file_data.append({
+        row = {
             "source_file": rel_path,
             "chunk_id": i,
             "lang": lang,
@@ -234,7 +290,11 @@ def process_file(file_path, llm):
             "summary": summary,
             "keywords": keywords,
             "original_content": content 
-        })
+        }
+        if is_short_stub:
+            row["is_stub"] = True
+            row["ingest_reason"] = "short_content"
+        file_data.append(row)
         
     return file_data
 

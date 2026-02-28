@@ -21,3 +21,5 @@ class GraphState(TypedDict, total=False):
     warnings: List[str]
     timeout_locations: List[str]
     retrieval_diagnostics: Dict[str, Any]
+    generation_diagnostics: Dict[str, Any]
+    retrieval_fingerprints: List[List[str]]

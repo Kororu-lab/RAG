@@ -2,7 +2,6 @@
 import os
 import sys
 import json
-import yaml
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
@@ -14,13 +13,47 @@ from src.utils import LLMUtility, load_config
 
 
 
+def _get_grounding_settings() -> dict:
+    config = load_config()
+    rag_cfg = config.get("rag", {}) or {}
+    answer_format_style = str(rag_cfg.get("answer_format_style", "fluent_with_table")).strip().lower()
+    if answer_format_style not in {"fluent_with_table", "concise_bullets"}:
+        answer_format_style = "fluent_with_table"
+    return {
+        "grounding_mode": str(rag_cfg.get("grounding_mode", "strict_extractive")).strip().lower(),
+        "require_inline_citations": bool(rag_cfg.get("require_inline_citations", True)),
+        "max_claims_per_answer": int(rag_cfg.get("max_claims_per_answer", 12)),
+        "missing_info_phrase": str(rag_cfg.get("missing_info_phrase", "정보가 부족합니다")).strip() or "정보가 부족합니다",
+        "answer_format_style": answer_format_style,
+    }
+
+
 def get_rag_chain(request_timeout_sec: int | None = None):
     """
     Creates and returns the RAG generation chain.
     """
     llm = get_llm("retrieval", request_timeout_sec=request_timeout_sec)
+    settings = _get_grounding_settings()
+    grounding_mode = settings["grounding_mode"]
+    require_inline_citations = settings["require_inline_citations"]
+    max_claims_per_answer = max(1, settings["max_claims_per_answer"])
+    missing_info_phrase = settings["missing_info_phrase"]
+    answer_format_style = settings["answer_format_style"]
 
-    system_text = """당신은 언어학 데이터베이스(LTDB) 전문 연구원입니다.
+    if grounding_mode == "strict_extractive":
+        system_text = """당신은 LTDB 문맥 기반 추출 응답기입니다.
+핵심 원칙:
+1) [Context]에 명시된 정보만 사용하십시오.
+2) [Context]에 없는 사실은 절대 추가하지 마십시오.
+3) 각 주장(문장/핵심 bullet) 끝에 반드시 근거 ref 태그를 붙이십시오.
+4) 태그는 반드시 [lang/file.html:chunk_id] 형식으로만 쓰십시오.
+   예) [archi/12_vowel.html:0]
+5) [Context]의 Ref ID에서 위 canonical 부분만 사용하고, 제목/설명을 태그에 넣지 마십시오.
+6) 근거가 없으면 해당 항목은 간단히 '자료 없음'으로 표시하십시오.
+7) 과도한 확장 설명, 추측, 외부 상식 보충을 금지합니다.
+8) 한국어로 간결하고 정확하게 답하십시오."""
+    else:
+        system_text = """당신은 언어학 데이터베이스(LTDB) 전문 연구원입니다.
 1. **문맥 기반 답변 (Truthfulness)**
    - 제공된 [Context]에 있는 내용만을 바탕으로 답변을 구성하십시오.
    - 문맥에 없는 내용은 추측하여 생성하지 말고, 정보가 없으면 솔직히 명시하십시오.
@@ -37,6 +70,18 @@ def get_rag_chain(request_timeout_sec: int | None = None):
    - 한국어로 답변하십시오.
    - 전문 용어는 영어/원어를 병기하십시오."""
 
+    citation_rule = (
+        "6. **Inline Evidence Tags**: 모든 주장 끝에 [lang/file.html:chunk_id] 태그를 붙이십시오."
+        if require_inline_citations
+        else "6. **Inline Evidence Tags**: 가능하면 [lang/file.html:chunk_id] 태그를 붙이십시오."
+    )
+    style_rule = (
+        "9. **Format**: 짧은 도입(1-2문장) + 필요 시 비교표 1개 + 짧은 결론(1-2문장). "
+        "표의 모든 데이터 행 끝에 근거 태그를 붙이고, 표 밖의 문장도 문장마다 근거 태그를 붙이십시오."
+        if answer_format_style == "fluent_with_table"
+        else "9. **Format**: 핵심 불릿 위주로 간결하게 작성하십시오."
+    )
+
     human_text = """[Context]
 {context}
 
@@ -49,6 +94,10 @@ def get_rag_chain(request_timeout_sec: int | None = None):
 3. **NO Meta-Commentary**: Just answer content.
 4. **Language**: Answer in **Korean**.
 5. **Tone**: Academic, precise. 
+{citation_rule}
+7. **Claim Count Limit**: 핵심 주장/불릿은 최대 {max_claims_per_answer}개.
+8. 근거 없는 항목은 "{missing_info_phrase}" 또는 "자료 없음"으로 짧게 명시.
+{style_rule}
 
 Answer:"""
 
@@ -69,7 +118,25 @@ def generate_answer(
     Generates an answer string programmatically.
     """
     chain = get_rag_chain(request_timeout_sec=request_timeout_sec)
-    response = chain.invoke({"context": context, "question": query})
+    settings = _get_grounding_settings()
+    response = chain.invoke(
+        {
+            "context": context,
+            "question": query,
+            "citation_rule": (
+                "필수"
+                if settings["require_inline_citations"]
+                else "권장"
+            ),
+            "max_claims_per_answer": max(1, settings["max_claims_per_answer"]),
+            "missing_info_phrase": settings["missing_info_phrase"],
+            "style_rule": (
+                "9. **Format**: 짧은 도입(1-2문장) + 필요 시 비교표 1개 + 짧은 결론(1-2문장). 표의 모든 데이터 행 끝에 근거 태그를 붙이고, 표 밖의 문장도 문장마다 근거 태그를 붙이십시오."
+                if settings["answer_format_style"] == "fluent_with_table"
+                else "9. **Format**: 핵심 불릿 위주로 간결하게 작성하십시오."
+            ),
+        }
+    )
     return response
 
 def generate():
@@ -94,6 +161,23 @@ def generate():
     print(f"Stage 2: Generating Answer with {llm_model}...")
     
     chain = get_rag_chain()
+    settings = _get_grounding_settings()
+    invoke_payload = {
+        "context": context,
+        "question": query,
+        "citation_rule": (
+            "필수"
+            if settings["require_inline_citations"]
+            else "권장"
+        ),
+        "max_claims_per_answer": max(1, settings["max_claims_per_answer"]),
+        "missing_info_phrase": settings["missing_info_phrase"],
+        "style_rule": (
+            "9. **Format**: 짧은 도입(1-2문장) + 필요 시 비교표 1개 + 짧은 결론(1-2문장). 표의 모든 데이터 행 끝에 근거 태그를 붙이고, 표 밖의 문장도 문장마다 근거 태그를 붙이십시오."
+            if settings["answer_format_style"] == "fluent_with_table"
+            else "9. **Format**: 핵심 불릿 위주로 간결하게 작성하십시오."
+        ),
+    }
     
     print(f"Model: {llm_model}")
     print("-" * 50)
@@ -102,7 +186,7 @@ def generate():
     stream_active = False
     try:
         full_response = ""
-        for chunk in chain.stream({"context": context, "question": query}):
+        for chunk in chain.stream(invoke_payload):
             print(chunk, end="", flush=True)
             full_response += chunk
             stream_active = True
@@ -112,7 +196,7 @@ def generate():
     if not stream_active:
         print("\\n[Warning] Stream returned empty. Retrying with invoke()...")
         try:
-            response = chain.invoke({"context": context, "question": query})
+            response = chain.invoke(invoke_payload)
             print(response)
         except Exception as e:
             print(f"\\n[Error during invoke] {e}")

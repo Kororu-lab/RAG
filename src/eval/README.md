@@ -2,27 +2,29 @@
 
 This folder contains example inputs for large harness runs (for example, 50 x 3 query types).
 
-## 1) Minimal input for current ablation runner
+## 1) Minimal input for ablation runner
 
-Use `queries_only_example.jsonl` when running `scripts/run_ablation.py`.
+Use `queries_only_example.jsonl` for smoke runs with no gold labels.
 
 Required per line:
 - `query_id` (recommended, string)
 - one of: `query`, `question`, or `text`
 
-Extra fields are allowed but ignored by `run_ablation.py`.
+Extra fields are allowed.
 
 Example run:
 
 ```bash
-uv run python scripts/run_ablation.py \
+uv run python src/eval/run_ablation.py \
   --queries src/eval/queries_only_example.jsonl \
-  --profiles E0,E1,E2,E3,E4,E5
+  --profiles B0,B1,B2,B3,B4,B5,B6,B7
 ```
+
+Default output directory is `eval/runs/<run_id>/` (override with `--outdir`).
 
 ## 2) Rich QA set for retrieval/eval metrics
 
-Use `qa_set_example.json` or `qa_set_example.jsonl` for harness evaluation.
+Use `qa_set_example.json` or `qa_set_example.jsonl` for full metrics.
 
 Recommended fields:
 - `query_id`
@@ -37,4 +39,15 @@ The rich format supports:
 - retrieval recall at doc/chunk level,
 - per-type slicing (3 groups),
 - language-detection and filter diagnostics analysis.
+- profile ablation (`B0..B6`) and separate E2E track (`B7`).
 
+Metrics are reported at `K={5,10,20,30}`:
+- `chunk_recall_at_K`
+- `doc_recall_at_K`
+- `mrr_at_K`
+
+Output layout (per run id):
+- `B0..B6/`: retrieval traces + summaries
+- `B7/`: E2E traces + summaries
+- `retrieval_macro_micro.csv`: retrieval-only aggregates
+- `e2e_macro_micro.csv`: E2E aggregates (separate table)

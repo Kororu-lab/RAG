@@ -12,6 +12,8 @@ except ImportError:
 
 from src.utils import load_config
 
+_TIMEOUT_LOGGED_KEYS: set[tuple[str, str, str, int | None, str]] = set()
+
 
 def _resolve_request_timeout(
     cfg: dict,
@@ -28,12 +30,12 @@ def _resolve_request_timeout(
     if profile != "retrieval":
         return None
 
-    raw_timeout = cfg.get("request_timeout_sec", 45)
+    raw_timeout = cfg.get("request_timeout_sec", 600)
     try:
         timeout = int(raw_timeout)
-        return timeout if timeout > 0 else 45
+        return timeout if timeout > 0 else 600
     except Exception:
-        return 45
+        return 600
 
 
 def get_llm(profile: str = "retrieval", request_timeout_sec: int | None = None):
@@ -63,6 +65,21 @@ def get_llm(profile: str = "retrieval", request_timeout_sec: int | None = None):
         profile=profile,
         request_timeout_sec=request_timeout_sec,
     )
+    if profile == "retrieval":
+        timeout_source = "explicit_arg" if request_timeout_sec is not None else "config_or_default"
+        log_key = (
+            profile,
+            str(provider),
+            str(model_name),
+            resolved_timeout,
+            timeout_source,
+        )
+        if log_key not in _TIMEOUT_LOGGED_KEYS:
+            _TIMEOUT_LOGGED_KEYS.add(log_key)
+            print(
+                f"LLM_TIMEOUT_DIAGNOSTICS profile={profile} provider={provider} "
+                f"model={model_name} timeout_sec={resolved_timeout} source={timeout_source}"
+            )
     
     # 1. Ollama
     if provider == "ollama":

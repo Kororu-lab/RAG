@@ -3,6 +3,11 @@ project:
   data_path: "./data/ltdb"
   db_path: "./data/chroma_db"
 
+ingest:
+  l0:
+    min_content_chars: 10
+    allow_short_stub: false
+
 ### LLM Configuration Examples ###
 # 1. OpenAI (GPT-4)
 #   provider: "openai"
@@ -34,13 +39,29 @@ llm_retrieval:
   base_url: "http://localhost:11434"
   temperature: 0.1
   num_ctx: 8192
-  request_timeout_sec: 45
+  request_timeout_sec: 600
   lang_detect_retries: 2
   lang_detect_backoff_sec: 0.5
   lang_detect_candidate_k: 12
   lang_detect_card_chars: 220
   lang_detect_global_card_chars: 90
+  lang_json_retries: 1
+  lang_json_backoff_sec: 0.25
   api_key_env: "" # Environment variable for API Key (e.g. OPENAI_API_KEY). Leave blank for Ollama.
+
+rag:
+  generation_timeout_sec: 600
+  grounding_mode: "strict_extractive"       # strict_extractive | balanced
+  answer_format_style: "fluent_with_table"  # fluent_with_table | concise_bullets
+  require_inline_citations: true
+  grounding_min_citation_coverage: 0.85
+  fail_closed_on_guard: false               # false: keep fluent answer + warning, true: replace with safe extractive summary
+  hallucination_mode: "two_stage"           # two_stage | legacy
+  hallucination_ambiguous_policy: "pass_with_warning"  # pass_with_warning | rewrite
+  skip_rewrite_on_stable_retrieval: true
+  stable_retrieval_jaccard_threshold: 0.9
+  max_claims_per_answer: 12
+  missing_info_phrase: "정보가 부족합니다"
 
 embedding:
   model_name: "BAAI/bge-m3"
@@ -62,7 +83,12 @@ retrieval:
   enable_language_filter: true
   viking_use_detected_language: true
   recursive_retrieval: true  # Expand L1 summaries to L0 chunks
+  sibling_expansion: false   # Keep OFF by default for fair ablations
   vision_search: false       # ColPali vision search for tables/images
+  query_split:
+    enabled: true
+    max_languages: 3
+    branch_k_mode: "full_per_branch" # balanced | full_per_branch
   hybrid_search:
     enabled: true
     vector_weight: 0.6
@@ -79,7 +105,7 @@ retrieval:
 reranker:
   enabled: true
   model_name: "BAAI/bge-reranker-v2-m3"
-  top_n: 5
+  top_n: 30
   pre_rerank_cap: 300
   max_input_chars: 4000
 
