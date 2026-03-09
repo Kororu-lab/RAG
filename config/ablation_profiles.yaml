@@ -3,8 +3,17 @@ defaults:
     dynamic_scaling: false
     fixed_k: 30
     fixed_top_n: 30
-    l0_only: true
+    candidate_k: 60
+    strict_l0_only: false
+    l0_only: false
+    metadata_mode: query_only
+    use_distance_threshold: false
+    enable_llm_language_detection: false
     enable_language_filter: false
+    enable_parent_topic_filter: false
+    enable_child_topic_filter: false
+    enable_family_filter: false
+    enable_region_filter: false
     viking_use_detected_language: false
     recursive_retrieval: false
     sibling_expansion: false
@@ -12,7 +21,8 @@ defaults:
     query_split:
       enabled: false
       max_languages: 3
-      branch_k_mode: balanced
+      branch_k_mode: full_per_branch
+      max_branches: 4
     hybrid_search:
       enabled: false
     viking:
@@ -26,118 +36,150 @@ defaults:
   ablation:
     enabled: true
     force_deterministic: true
-    reranker_policy: follow_profile
     required_backend_mode: postgres
     profile_timeout_sec: 600
     run_mode: retrieval
+    b5_candidates: []
+    b5_frozen_candidate: ''
   rag:
     skip_grading: true
     skip_hallucination: true
-
 profiles:
   B0:
-    description: "Dense only baseline (vector-only, L0-only, no BM25, no Viking, no lang filter, no recursive)."
-
-  B1:
-    description: "B0 + BM25 hybrid."
+    description: Raw dense baseline (raw table, strict L0, dense cosine only).
+    database:
+      dbname: ltdb_rag
+      table_name: linguistics_raptor_raw_l0
     retrieval:
+      strict_l0_only: true
+      use_distance_threshold: false
+      candidate_k: 0
       hybrid_search:
-        enabled: true
-
-  B2:
-    description: "B1 + RAPTOR recursive (L1 retrieval + L1->L0 expansion)."
-    retrieval:
-      l0_only: false
-      recursive_retrieval: true
-      hybrid_search:
-        enabled: true
-
-  B3:
-    description: "B2 + Viking soft (language-agnostic; no language filter, no Viking language seed)."
-    retrieval:
-      l0_only: false
-      recursive_retrieval: true
-      hybrid_search:
-        enabled: true
-      viking:
-        enabled: true
-        mode: soft
+        enabled: false
+      recursive_retrieval: false
       enable_language_filter: false
-      viking_use_detected_language: false
-
+      enable_parent_topic_filter: false
+      enable_child_topic_filter: false
+      enable_family_filter: false
+      enable_region_filter: false
+      query_split:
+        enabled: false
+  B1:
+    description: Summary dense baseline (summary table, strict L0, dense cosine only).
+    database:
+      dbname: ltdb_rag
+      table_name: linguistics_raptor
+    retrieval:
+      strict_l0_only: true
+      use_distance_threshold: false
+      candidate_k: 0
+      hybrid_search:
+        enabled: false
+      recursive_retrieval: false
+      enable_language_filter: false
+      enable_parent_topic_filter: false
+      enable_child_topic_filter: false
+      enable_family_filter: false
+      enable_region_filter: false
+      query_split:
+        enabled: false
+  B2:
+    description: Hybrid baseline (B1 + BM25/RRF only).
+    database:
+      dbname: ltdb_rag
+      table_name: linguistics_raptor
+    retrieval:
+      strict_l0_only: true
+      use_distance_threshold: false
+      candidate_k: 60
+      recursive_retrieval: false
+      hybrid_search:
+        enabled: true
+      enable_language_filter: false
+      enable_parent_topic_filter: false
+      enable_child_topic_filter: false
+      query_split:
+        enabled: false
+  B3:
+    description: RAPTOR retrieval baseline (B1 + recursive L1->L0, no BM25).
+    database:
+      dbname: ltdb_rag
+      table_name: linguistics_raptor
+    retrieval:
+      l0_only: false
+      strict_l0_only: false
+      use_distance_threshold: false
+      candidate_k: 60
+      recursive_retrieval: true
+      hybrid_search:
+        enabled: false
+      enable_language_filter: false
+      enable_parent_topic_filter: false
+      enable_child_topic_filter: false
+      query_split:
+        enabled: false
   B4:
-    description: "B3 + language filter (and Viking language seed enabled)."
+    description: Metadata/Viking filtering baseline (query-derived filters only, no
+      BM25/recursive).
+    database:
+      dbname: ltdb_rag
+      table_name: linguistics_raptor
     retrieval:
-      l0_only: false
-      recursive_retrieval: true
+      strict_l0_only: true
+      use_distance_threshold: false
+      candidate_k: 60
+      recursive_retrieval: false
       hybrid_search:
-        enabled: true
-      viking:
-        enabled: true
-        mode: soft
+        enabled: false
       enable_language_filter: true
-      viking_use_detected_language: true
-
-  B5:
-    description: "B4 + split-query retrieval for multi-language queries."
-    retrieval:
-      l0_only: false
-      recursive_retrieval: true
-      hybrid_search:
-        enabled: true
-      viking:
-        enabled: true
-        mode: soft
-      enable_language_filter: true
-      viking_use_detected_language: true
+      enable_parent_topic_filter: true
+      enable_child_topic_filter: true
+      enable_family_filter: false
+      enable_region_filter: false
       query_split:
-        enabled: true
-        max_languages: 3
-        branch_k_mode: balanced
-
+        enabled: false
   B6:
-    description: "B5 + reranker."
-    retrieval:
-      l0_only: false
-      recursive_retrieval: true
-      hybrid_search:
-        enabled: true
-      viking:
-        enabled: true
-        mode: soft
-      enable_language_filter: true
-      viking_use_detected_language: true
-      query_split:
-        enabled: true
-        max_languages: 3
-        branch_k_mode: balanced
-      fixed_top_n: 30
-    reranker:
-      enabled: true
-      top_n: 30
-
-  B7:
-    description: "B6 + LangGraph E2E loop (grade/rewrite/hallucination)."
-    retrieval:
-      l0_only: false
-      recursive_retrieval: true
-      hybrid_search:
-        enabled: true
-      viking:
-        enabled: true
-        mode: soft
-      enable_language_filter: true
-      viking_use_detected_language: true
-      query_split:
-        enabled: true
-        max_languages: 3
-        branch_k_mode: balanced
-      fixed_top_n: 30
-    reranker:
-      enabled: true
-      top_n: 30
-    rag:
-      skip_grading: false
-      skip_hallucination: false
+    description: B4 + reranker (global post-merge rerank).
     ablation:
-      run_mode: e2e
+      base_profile: B4
+      run_mode: retrieval
+    retrieval:
+      query_split:
+        enabled: false
+    reranker:
+      enabled: true
+      top_n: 30
+  B7:
+    description: 'Finalized paper-facing B7: physically materialized language split
+      with recovered front-door, hard-seeded local B6 branches, and post-merge rerank.'
+    ablation:
+      base_profile: B4
+      run_mode: retrieval
+    retrieval:
+      strict_l0_only: true
+      use_distance_threshold: false
+      candidate_k: 60
+      recursive_retrieval: false
+      enable_language_filter: true
+      enable_parent_topic_filter: true
+      enable_child_topic_filter: true
+      enable_family_filter: false
+      enable_region_filter: false
+      hybrid_search:
+        enabled: false
+      query_split:
+        enabled: true
+        controller_mode: t71_materialized_language_local_b6
+        axis_mode: language_only
+        enable_language_axis: true
+        enable_topic_axis: false
+        strict_single_axis: true
+        max_branches: 2
+        branch_query_mode: surface_preserving_materialized
+        feedback_gating: false
+        post_merge_rerank_mode: global
+        language_diversity_guard_enabled: true
+        language_diversity_min_per_branch: 1
+    reranker:
+      enabled: true
+      top_n: 30

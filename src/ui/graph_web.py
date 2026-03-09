@@ -89,6 +89,14 @@ with st.sidebar:
     
     # Retrieval Settings
     st.header("⚙️ Retrieval Settings")
+    st.subheader("Language / Metadata")
+    language_detection_enabled = st.checkbox("LLM Language Detection", value=True)
+    language_filter_enabled = st.checkbox("Language Filter", value=True)
+    viking_use_detected_language_enabled = st.checkbox(
+        "Viking Use Detected Language", value=True
+    )
+
+    st.subheader("Retrieval Components")
     bm25_enabled = st.checkbox("BM25 Hybrid Search", value=True)
     reranker_enabled = st.checkbox("Reranker", value=True)
     recursive_enabled = st.checkbox("Recursive Retrieval", value=True)
@@ -104,7 +112,11 @@ with st.sidebar:
     show_original_html = st.checkbox("Show Original HTML for Retrieved Refs", value=True)
 
     st.subheader("Split Query Retrieval")
-    query_split_enabled = st.checkbox("Split Query (Multi-language)", value=True)
+    query_split_enabled = st.checkbox(
+        "Split Query (Multi-language)",
+        value=True,
+        disabled=not language_detection_enabled,
+    )
     query_split_max_languages = st.number_input(
         "Split Max Languages",
         min_value=2,
@@ -117,7 +129,7 @@ with st.sidebar:
         "Split Branch K Mode",
         options=["balanced", "full_per_branch"],
         index=1,
-        disabled=not query_split_enabled,
+        disabled=(not query_split_enabled) or (not language_detection_enabled),
     )
 
     st.subheader("Viking Routing")
@@ -136,6 +148,9 @@ with st.sidebar:
         return apply_runtime_overrides(
             base_config,
             selected_model=selected_model,
+            language_detection_enabled=language_detection_enabled,
+            language_filter_enabled=language_filter_enabled,
+            viking_use_detected_language_enabled=viking_use_detected_language_enabled,
             bm25_enabled=bm25_enabled,
             reranker_enabled=reranker_enabled,
             recursive_enabled=recursive_enabled,

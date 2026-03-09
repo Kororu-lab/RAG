@@ -11,11 +11,17 @@ from langchain_core.prompts import ChatPromptTemplate
 import src.utils
 from src.agent.state import GraphState
 from src.agent.chains import get_grade_chain, get_rewrite_chain, get_hallucination_chain
+from src.eval.finalized_b7_runtime import (
+    FINALIZED_B7_CONTROLLER_MODES,
+    run_finalized_b7_retrieval,
+)
+from src.eval.metadata_store import load_metadata_store
 from src.llm.factory import get_llm
 from src.llm.json_retry import parse_json_strict, repair_json_text
 from src.llm.rag_generate import generate_answer
 from src.retrieve.rag_retrieve import RAGRetriever, extract_query_metadata
 from src.retrieve.split_budget import compute_split_budgets
+from src.retrieve.viking_lexicon_loader import load_viking_lexicon
 
 def _build_structured_metadata(d) -> Dict[str, str]:
     """
@@ -635,128 +641,55 @@ def retrieve_node(state: GraphState):
 
 
     with RAGRetriever() as retriever:
-        # Metadata Extraction Logic (New)
-        print("  - Analyzing Query Metadata...")
-        metadata = extract_query_metadata(question, retriever.config)
-        retrieval_diagnostics = metadata.get("_diagnostics", {})
-        if not isinstance(retrieval_diagnostics, dict):
-            retrieval_diagnostics = {}
-            metadata["_diagnostics"] = retrieval_diagnostics
-        retrieval_diagnostics.setdefault("split_applied", False)
-        retrieval_diagnostics.setdefault("split_branches", [])
-        retrieval_diagnostics.setdefault("split_json_retry_count", 0)
-        retrieval_diagnostics.setdefault("split_json_fail_open", False)
-        timeout_loc = retrieval_diagnostics.get("timeout_location", "none")
-        if timeout_loc != "none":
-            print(f"TIMEOUT_DIAGNOSTIC timeout_location={timeout_loc}")
-            _append_warning(
-                warnings,
-                timeout_locations,
-                f"Language detection timeout at {timeout_loc}; proceeding without language filter.",
-                timeout_loc,
-            )
-
         query_split_cfg = retrieval_cfg.get("query_split", {})
         split_enabled = bool(query_split_cfg.get("enabled", True))
-        max_languages = int(query_split_cfg.get("max_languages", 3))
-        branch_mode = str(query_split_cfg.get("branch_k_mode", "full_per_branch"))
-        llm_cfg = config.get("llm_retrieval", {})
-        split_retries = int(llm_cfg.get("lang_detect_retries", 2))
-        split_backoff_sec = float(llm_cfg.get("lang_detect_backoff_sec", 0.5))
-        split_json_retries = int(llm_cfg.get("lang_json_retries", 1))
-        split_json_backoff_sec = float(llm_cfg.get("lang_json_backoff_sec", 0.25))
+        controller_mode = str(query_split_cfg.get("controller_mode", "heuristic")).strip().lower()
 
-        detected_languages = []
-        if isinstance(metadata.get("lang"), list):
-            detected_languages = [str(v).strip() for v in metadata.get("lang", []) if str(v).strip()]
-        if not detected_languages:
-            detected_languages = [
-                str(v).strip()
-                for v in retrieval_diagnostics.get("detected_languages", [])
-                if str(v).strip()
-            ]
-
-        if (
-            split_enabled
-            and branch_mode in {"balanced", "full_per_branch"}
-            and len(detected_languages) >= 2
-        ):
-            languages = detected_languages[:max(2, max_languages)]
-            try:
-                split_queries, split_json_retry_count = _generate_split_queries(
-                    question=question,
-                    languages=languages,
-                    retries=max(0, split_retries),
-                    backoff_sec=max(0.0, split_backoff_sec),
-                    json_retries=max(0, split_json_retries),
-                    json_backoff_sec=max(0.0, split_json_backoff_sec),
-                )
-                budgets = compute_split_budgets(
-                    total_k=k,
-                    total_top_n=top_n,
-                    branch_count=len(languages),
-                    mode=branch_mode,
-                )
-                split_branch_docs: Dict[str, List[Any]] = {}
-
-                for i, lang in enumerate(languages):
-                    branch_k = budgets.k_allocs[i]
-                    if branch_k <= 0:
-                        continue
-                    branch_top_n = max(1, budgets.top_n_allocs[i])
-                    branch_metadata = deepcopy(metadata)
-                    branch_metadata["lang"] = lang
-                    branch_diag = branch_metadata.setdefault("_diagnostics", {})
-                    branch_diag["split_applied"] = True
-                    branch_diag["split_branches"] = languages
-                    branch_docs = retriever.retrieve_documents(
-                        split_queries[lang],
-                        k=branch_k,
-                        top_n=branch_top_n,
-                        metadata=branch_metadata,
-                    )
-                    split_branch_docs[lang] = branch_docs
-
-                new_docs = _merge_split_docs(
-                    branch_docs=split_branch_docs,
-                    language_order=languages,
-                    merge_cap=max(1, budgets.merge_cap),
-                )
-                retrieval_diagnostics["split_applied"] = True
-                retrieval_diagnostics["split_branches"] = languages
-                retrieval_diagnostics["detected_languages"] = languages
-                retrieval_diagnostics["filter_applied"] = True
-                retrieval_diagnostics["split_json_retry_count"] = int(split_json_retry_count)
-                retrieval_diagnostics["split_json_fail_open"] = False
-                print(
-                    "SPLIT_QUERY_DIAGNOSTICS "
-                    f"split_applied=true split_branches={languages} "
-                    f"branch_mode={branch_mode} merge_cap={max(1, budgets.merge_cap)} "
-                    f"k_allocs={budgets.k_allocs} top_n_allocs={budgets.top_n_allocs} "
-                    f"split_json_retry_count={split_json_retry_count}"
-                )
-            except Exception as e:
-                retrieval_diagnostics["split_applied"] = False
-                retrieval_diagnostics["split_branches"] = []
-                retrieval_diagnostics["split_json_fail_open"] = True
-                print(f"SPLIT_QUERY_FALLBACK reason={e}")
+        if split_enabled and controller_mode in FINALIZED_B7_CONTROLLER_MODES:
+            print("  - Running finalized B7 materialized split runtime path...")
+            metadata_store = load_metadata_store("metadata.enriched.csv")
+            phenomenon_lexicon, category_lexicon = load_viking_lexicon(
+                config.get("retrieval", {}).get("viking", {}).get("lexicon_path", "config/viking_lexicon.yaml")
+            )
+            metadata, new_docs, split_warnings, _meta_sec, _ret_sec = run_finalized_b7_retrieval(
+                retriever=retriever,
+                query_id=str(state.get("query_id") or "web_ui_query"),
+                query_text=question,
+                profile_cfg=config,
+                fixed_k=k,
+                fixed_top_n=top_n,
+                metadata_store=metadata_store,
+                phenomenon_lexicon=phenomenon_lexicon,
+                category_lexicon=category_lexicon,
+            )
+            retrieval_diagnostics = metadata.get("_diagnostics", {})
+            if not isinstance(retrieval_diagnostics, dict):
+                retrieval_diagnostics = {}
+                metadata["_diagnostics"] = retrieval_diagnostics
+            for warning in split_warnings:
+                if warning not in warnings:
+                    warnings.append(warning)
+        else:
+            # Metadata Extraction Logic (legacy one-shot retrieval path only)
+            print("  - Analyzing Query Metadata...")
+            metadata = extract_query_metadata(question, retriever.config)
+            retrieval_diagnostics = metadata.get("_diagnostics", {})
+            if not isinstance(retrieval_diagnostics, dict):
+                retrieval_diagnostics = {}
+                metadata["_diagnostics"] = retrieval_diagnostics
+            retrieval_diagnostics.setdefault("split_applied", False)
+            retrieval_diagnostics.setdefault("split_branches", [])
+            retrieval_diagnostics.setdefault("split_json_retry_count", 0)
+            retrieval_diagnostics.setdefault("split_json_fail_open", False)
+            timeout_loc = retrieval_diagnostics.get("timeout_location", "none")
+            if timeout_loc != "none":
+                print(f"TIMEOUT_DIAGNOSTIC timeout_location={timeout_loc}")
                 _append_warning(
                     warnings,
                     timeout_locations,
-                    f"Split-query generation/retrieval failed ({e}); fallback to one-shot multi-language retrieval.",
-                    None,
+                    f"Language detection timeout at {timeout_loc}; proceeding without language filter.",
+                    timeout_loc,
                 )
-                if _is_timeout_exception(e):
-                    timeout_loc = "split_query_generation"
-                    print(f"TIMEOUT_DIAGNOSTIC timeout_location={timeout_loc}")
-                    _append_warning(
-                        warnings,
-                        timeout_locations,
-                        f"Split-query timeout at {timeout_loc}; fallback applied.",
-                        timeout_loc,
-                    )
-                new_docs = retriever.retrieve_documents(question, k=k, top_n=top_n, metadata=metadata)
-        else:
             new_docs = retriever.retrieve_documents(question, k=k, top_n=top_n, metadata=metadata)
     
     # Merge and deduplicate

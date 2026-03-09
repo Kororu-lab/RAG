@@ -14,6 +14,19 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 
 from src.utils import load_config, LLMUtility, resolve_torch_device, clear_torch_cache
 
+EMBED_FIELDS = ("summary", "original_content")
+METADATA_MODES = ("full", "raw_strict")
+RAW_STRICT_META_KEYS = (
+    "source_file",
+    "chunk_id",
+    "lang",
+    "type",
+    "level",
+    "original_header",
+    "original_content",
+)
+
+
 def get_db_connection(config: Dict):
     """Establishes connection to PostgreSQL."""
     db_cfg = config['database']
@@ -104,6 +117,27 @@ def load_data(file_path: str) -> List[Dict]:
     return data
 
 
+def select_embedding_text(item: Dict[str, Any], embed_field: str) -> str:
+    """Selects text used for vectorization with fallback."""
+    if embed_field == "original_content":
+        text = item.get("original_content") or item.get("summary") or ""
+    else:
+        text = item.get("summary") or item.get("original_content") or ""
+    return str(text).strip()
+
+
+def sanitize_metadata(item: Dict[str, Any], metadata_mode: str) -> Dict[str, Any]:
+    """Sanitizes metadata payload for table-specific use cases."""
+    if metadata_mode == "full":
+        return dict(item)
+
+    cleaned: Dict[str, Any] = {}
+    for key in RAW_STRICT_META_KEYS:
+        if key in item:
+            cleaned[key] = item[key]
+    return cleaned
+
+
 def build_upsert_sql(table_name: str):
     return sql.SQL(
         """
@@ -130,10 +164,48 @@ def main():
         action="store_true",
         help="Validate DB/table setup only. Skip embedding, inserts, and BM25 build.",
     )
+    parser.add_argument(
+        "--table-name",
+        default=None,
+        help="Override destination table name. Default: config.database.table_name",
+    )
+    parser.add_argument(
+        "--embed-field",
+        choices=EMBED_FIELDS,
+        default="summary",
+        help="Text field to embed from JSONL rows.",
+    )
+    parser.add_argument(
+        "--l0-only",
+        action="store_true",
+        help="Ingest only L0 JSONL rows (skip L1 rows).",
+    )
+    parser.add_argument(
+        "--skip-bm25",
+        action="store_true",
+        help="Skip BM25 index build step.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Embedding/upsert batch size.",
+    )
+    parser.add_argument(
+        "--metadata-mode",
+        choices=METADATA_MODES,
+        default="full",
+        help="Metadata payload mode. raw_strict keeps only raw-core fields.",
+    )
     args = parser.parse_args()
 
     print(f"Finalize mode: {args.mode}")
     print(f"Dry run: {args.dry_run}")
+    print(f"Embedding field: {args.embed_field}")
+    print(f"Metadata mode: {args.metadata_mode}")
+    print(f"L0 only: {args.l0_only}")
+    print(f"Skip BM25: {args.skip_bm25}")
+    print(f"Batch size: {args.batch_size}")
     if args.mode == "upsert":
         print("Note: On first deployment, run once with --mode rebuild for a clean initial baseline.")
 
@@ -141,7 +213,8 @@ def main():
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     config = load_config()
-    db_table = config['database']['table_name']
+    db_table = args.table_name or config['database']['table_name']
+    print(f"Target table: {db_table}")
     configured_device = config.get("embedding", {}).get("device", "auto")
     device = resolve_torch_device(configured_device)
 
@@ -192,13 +265,13 @@ def main():
     # Load Data
     print("Loading Data...")
     l0_data = load_data(os.path.join("data", "raptor", "matrix_raptor_L0_data.jsonl"))
-    l1_data = load_data(os.path.join("data", "raptor", "matrix_raptor_L1_data.jsonl"))
+    l1_data = [] if args.l0_only else load_data(os.path.join("data", "raptor", "matrix_raptor_L1_data.jsonl"))
     
     all_data = l0_data + l1_data
     print(f"Total entries to process: {len(all_data)} (L0: {len(l0_data)}, L1: {len(l1_data)})")
     
     # Processing & Insertion
-    batch_size = 8
+    batch_size = max(1, int(args.batch_size))
     total_embedded = 0
     
     print("Starting Ingestion...")
@@ -207,15 +280,17 @@ def main():
 
         batch_texts = []
         batch_metas = []
+        batch_sanitized_metas = []
         
-        for i, item in enumerate(all_data):
+        for item in all_data:
             # Prepare Text Content
-            text = item.get("summary", "")
+            text = select_embedding_text(item, args.embed_field)
             if not text:
                 continue
             
             batch_texts.append(text)
             batch_metas.append(item)
+            batch_sanitized_metas.append(sanitize_metadata(item, args.metadata_mode))
             
             # Flush Batch
             if len(batch_texts) >= batch_size:
@@ -224,8 +299,8 @@ def main():
                 
                 # Insert
                 args_list = [
-                    (build_doc_key(meta), text, vectors[j], Json(meta))
-                    for j, (text, meta) in enumerate(zip(batch_texts, batch_metas))
+                    (build_doc_key(batch_metas[j]), text, vectors[j], Json(batch_sanitized_metas[j]))
+                    for j, text in enumerate(batch_texts)
                 ]
                 
                 # Psycopg2 execute_values equivalent loop
@@ -239,13 +314,14 @@ def main():
                 # Reset Batch
                 batch_texts = []
                 batch_metas = []
+                batch_sanitized_metas = []
         
         # Flush Remaining
         if batch_texts:
             vectors = embeddings.embed_documents(batch_texts)
             args_list = [
-                (build_doc_key(meta), text, vectors[j], Json(meta))
-                for j, (text, meta) in enumerate(zip(batch_texts, batch_metas))
+                (build_doc_key(batch_metas[j]), text, vectors[j], Json(batch_sanitized_metas[j]))
+                for j, text in enumerate(batch_texts)
             ]
             for doc_key_val, content_val, vector_val, meta_val in args_list:
                 cur.execute(upsert_sql, (doc_key_val, content_val, vector_val, meta_val))
@@ -255,14 +331,17 @@ def main():
     print(f"Ingestion Complete. {total_embedded} vectors stored in table '{db_table}'.")
     
     # Build BM25 Index
-    print("\nBuilding BM25 index for hybrid search...")
-    try:
-        from src.retrieve.bm25_search import BM25Index
-        index_path = config.get("retrieval", {}).get("hybrid_search", {}).get("index_path", "data/bm25_index.pkl")
-        bm25 = BM25Index(index_path)
-        bm25.build_from_db(conn, db_table)
-    except Exception as e:
-        print(f"Warning: BM25 index build failed: {e}")
+    if args.skip_bm25:
+        print("\nSkipping BM25 index build (--skip-bm25).")
+    else:
+        print("\nBuilding BM25 index for hybrid search...")
+        try:
+            from src.retrieve.bm25_search import BM25Index
+            index_path = config.get("retrieval", {}).get("hybrid_search", {}).get("index_path", "data/bm25_index.pkl")
+            bm25 = BM25Index(index_path)
+            bm25.build_from_db(conn, db_table)
+        except Exception as e:
+            print(f"Warning: BM25 index build failed: {e}")
     
     conn.close()
 

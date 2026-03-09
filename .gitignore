@@ -1,6 +1,7 @@
 # Data files
 *.jsonl
 *.json
+*.csv
 data/*
 !data/README.md
 tests/*

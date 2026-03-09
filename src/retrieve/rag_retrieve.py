@@ -8,6 +8,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")
 import yaml
 import json
 import argparse
+import csv
 import psycopg2
 from psycopg2 import sql
 import time
@@ -101,6 +102,20 @@ def _as_lang_list(value: Any) -> List[str]:
     return []
 
 
+def _as_str_list(value: Any) -> List[str]:
+    if isinstance(value, str):
+        normalized = value.strip()
+        return [normalized] if normalized else []
+    if isinstance(value, list):
+        out: List[str] = []
+        for item in value:
+            s = str(item).strip()
+            if s:
+                out.append(s)
+        return out
+    return []
+
+
 def _coerce_numeric(value: Any, default: int, minimum: int) -> int:
     try:
         parsed = int(value)
@@ -146,6 +161,75 @@ def _is_timeout_exception(exc: Exception) -> bool:
     )
 
 
+def _load_phase_a_language_pool(
+    *,
+    doc_dir: str,
+    data_path: str,
+    retrieval_cfg: Dict[str, Any],
+    diagnostics: Dict[str, Any],
+) -> List[str]:
+    known_languages: List[str] = []
+    if os.path.exists(doc_dir):
+        known_languages = sorted(
+            [d for d in os.listdir(doc_dir) if os.path.isdir(os.path.join(doc_dir, d))]
+        )
+
+    diagnostics["phase_a_pool_total_before"] = len(known_languages)
+    diagnostics["phase_a_pool_excluded_zero_source"] = []
+
+    exclude_zero_source = bool(retrieval_cfg.get("lang_detect_exclude_zero_source", True))
+    configured_metadata_csv = str(retrieval_cfg.get("metadata_csv_path", "")).strip()
+    candidate_paths = []
+    if configured_metadata_csv:
+        candidate_paths.append(configured_metadata_csv)
+    candidate_paths.append(os.path.join(data_path, "metadata.csv"))
+    candidate_paths.append(os.path.join(os.path.dirname(data_path), "metadata.csv"))
+    candidate_paths.append(os.path.join("data", "metadata.csv"))
+
+    metadata_csv_path = ""
+    for path in candidate_paths:
+        if path and os.path.exists(path):
+            metadata_csv_path = path
+            break
+
+    if not exclude_zero_source or not known_languages or not metadata_csv_path:
+        diagnostics["phase_a_pool_total_after"] = len(known_languages)
+        return known_languages
+
+    allowed_langs = set()
+    try:
+        with open(metadata_csv_path, "r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                lang_id = str(row.get("lang_id", "")).strip()
+                if not lang_id:
+                    continue
+                raw_count = str(row.get("source_file_count", "")).strip()
+                try:
+                    source_file_count = int(raw_count) if raw_count else 0
+                except Exception:
+                    source_file_count = 0
+                if source_file_count > 0:
+                    allowed_langs.add(lang_id)
+    except Exception as e:
+        print(f"Phase A language pool metadata read failed: {e}")
+        diagnostics["phase_a_pool_total_after"] = len(known_languages)
+        return known_languages
+
+    filtered = [lang for lang in known_languages if lang in allowed_langs]
+    excluded = [lang for lang in known_languages if lang not in allowed_langs]
+    diagnostics["phase_a_pool_excluded_zero_source"] = excluded
+    diagnostics["phase_a_pool_total_after"] = len(filtered)
+
+    if excluded:
+        print(
+            "Phase A language pool exclusion (source_file_count=0): "
+            f"excluded={len(excluded)} langs={excluded}"
+        )
+
+    return filtered
+
+
 def extract_query_metadata(query: str, config: Dict[str, Any]) -> Dict[str, Any]:
     """
     Extracts metadata (Language) from the user query.
@@ -178,12 +262,45 @@ def extract_query_metadata(query: str, config: Dict[str, Any]) -> Dict[str, Any]
 
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-    # Language candidates come from doc directory names (closed-world set)
+    # Language candidates come from doc directory names (closed-world set),
+    # optionally pruned by metadata source_file_count > 0.
     data_path = config["project"]["data_path"]
     doc_dir = os.path.join(data_path, "doc")
-    known_languages = []
-    if os.path.exists(doc_dir):
-        known_languages = [d for d in os.listdir(doc_dir) if os.path.isdir(os.path.join(doc_dir, d))]
+    known_languages = _load_phase_a_language_pool(
+        doc_dir=doc_dir,
+        data_path=data_path,
+        retrieval_cfg=retrieval_cfg,
+        diagnostics=diagnostics,
+    )
+
+    # Optional hard-off switch for metadata language detection (useful for baseline runs).
+    if not bool(retrieval_cfg.get("enable_llm_language_detection", True)):
+        diagnostics["lang_detect_method"] = "disabled"
+        diagnostics["lang_detect_stage"] = "disabled"
+        print("Language Detection: disabled by retrieval.enable_llm_language_detection=false")
+        print(
+            "LANG_DETECT_DIAGNOSTICS "
+            f"lang_detect_method={diagnostics['lang_detect_method']} "
+            f"lang_detect_stage={diagnostics.get('lang_detect_stage', 'none')} "
+            f"lang_json_retry_count={diagnostics.get('lang_json_retry_count', 0)} "
+            f"lang_json_valid_stage_a={diagnostics.get('lang_json_valid_stage_a', False)} "
+            f"lang_json_valid_stage_b={diagnostics.get('lang_json_valid_stage_b', False)} "
+            f"lang_json_fail_open={diagnostics.get('lang_json_fail_open', False)} "
+            f"detected_languages_candidates={diagnostics.get('detected_languages_candidates', [])} "
+            f"detected_languages={diagnostics['detected_languages']} "
+            f"split_applied={diagnostics.get('split_applied', False)} "
+            f"split_branches={diagnostics.get('split_branches', [])} "
+            f"enable_language_filter={diagnostics.get('enable_language_filter', True)} "
+            f"viking_use_detected_language={diagnostics.get('viking_use_detected_language', True)} "
+            f"viking_language_seeded={diagnostics.get('viking_language_seeded', False)} "
+            f"l0_only={diagnostics.get('l0_only', False)} "
+            f"filter_applied={diagnostics['filter_applied']} "
+            f"phase_a_pool_total_before={diagnostics.get('phase_a_pool_total_before', 0)} "
+            f"phase_a_pool_total_after={diagnostics.get('phase_a_pool_total_after', 0)} "
+            f"phase_a_pool_excluded_zero_source_count={len(diagnostics.get('phase_a_pool_excluded_zero_source', []))} "
+            f"timeout_location={diagnostics['timeout_location']}"
+        )
+        return metadata
 
     # LLM-based language detection (closed-world against doc directory names)
     llm = None
@@ -443,6 +560,9 @@ JSON:"""
         f"viking_language_seeded={diagnostics.get('viking_language_seeded', False)} "
         f"l0_only={diagnostics.get('l0_only', False)} "
         f"filter_applied={diagnostics['filter_applied']} "
+        f"phase_a_pool_total_before={diagnostics.get('phase_a_pool_total_before', 0)} "
+        f"phase_a_pool_total_after={diagnostics.get('phase_a_pool_total_after', 0)} "
+        f"phase_a_pool_excluded_zero_source_count={len(diagnostics.get('phase_a_pool_excluded_zero_source', []))} "
         f"timeout_location={diagnostics['timeout_location']}"
     )
 
@@ -472,6 +592,8 @@ class RAGRetriever:
         reranker_cfg = self.config.get("reranker", {})
         self.pre_rerank_cap = max(0, int(reranker_cfg.get("pre_rerank_cap", 300)))
         self.rerank_max_input_chars = max(256, int(reranker_cfg.get("max_input_chars", 4000)))
+        self._reranker = None
+        self._reranker_model_name = None
         
         # Connect to DB (Lightweight, keep open)
         print("Connecting to Vector Database (PostgreSQL)...")
@@ -500,6 +622,17 @@ class RAGRetriever:
         self.enable_language_filter = bool(retrieval_cfg.get("enable_language_filter", True))
         self.viking_use_detected_language = bool(retrieval_cfg.get("viking_use_detected_language", True))
         self.l0_only = bool(retrieval_cfg.get("l0_only", False))
+        self.strict_l0_only = bool(retrieval_cfg.get("strict_l0_only", False))
+        if self.strict_l0_only:
+            self.l0_only = True
+        self.use_distance_threshold = bool(retrieval_cfg.get("use_distance_threshold", True))
+        self.distance_threshold = float(retrieval_cfg.get("distance_threshold", 0.55))
+        self.candidate_k = max(0, int(retrieval_cfg.get("candidate_k", 0)))
+        self.metadata_mode = str(retrieval_cfg.get("metadata_mode", "runtime")).lower()
+        self.enable_parent_topic_filter = bool(retrieval_cfg.get("enable_parent_topic_filter", False))
+        self.enable_child_topic_filter = bool(retrieval_cfg.get("enable_child_topic_filter", False))
+        self.enable_family_filter = bool(retrieval_cfg.get("enable_family_filter", False))
+        self.enable_region_filter = bool(retrieval_cfg.get("enable_region_filter", False))
         self.vision_enabled = retrieval_cfg.get("vision_search", False)
         self.recursive_enabled = retrieval_cfg.get("recursive_retrieval", True)
         self.sibling_expansion = bool(retrieval_cfg.get("sibling_expansion", False))
@@ -515,6 +648,16 @@ class RAGRetriever:
 
     def close(self):
         """Safely close DB connection."""
+        reranker = getattr(self, "_reranker", None)
+        if reranker is not None:
+            try:
+                del reranker
+            except Exception as e:
+                print(f"Error releasing reranker: {e}")
+            finally:
+                self._reranker = None
+                self._reranker_model_name = None
+                self._clean_memory()
         conn = getattr(self, "conn", None)
         if conn is None:
             return
@@ -538,6 +681,28 @@ class RAGRetriever:
         import gc
         gc.collect()
         src.utils.clear_torch_cache()
+
+    def _get_reranker(self):
+        if (
+            self._reranker is None
+            or self._reranker_model_name != self.reranker_model_name
+        ):
+            if self._reranker is not None:
+                try:
+                    del self._reranker
+                except Exception:
+                    pass
+                self._reranker = None
+                self._reranker_model_name = None
+                self._clean_memory()
+            print(f"Loading Reranker ({self.reranker_model_name})...")
+            self._reranker = CrossEncoder(
+                self.reranker_model_name,
+                device=self.device,
+                trust_remote_code=True,
+            )
+            self._reranker_model_name = self.reranker_model_name
+        return self._reranker
 
     def _is_visual_query(self, query: str) -> bool:
         if not ColPaliRetriever or not self.vision_enabled:
@@ -633,21 +798,34 @@ class RAGRetriever:
         return filtered
 
     def _bm25_l0_filter(self, bm25_results):
-        """Apply metadata->>'level'='0' filter to BM25 results before RRF merge."""
+        """Apply L0 or strict-L0 filter to BM25 results before RRF merge."""
         if not bm25_results:
             return bm25_results
 
         doc_ids = [doc_id for doc_id, _ in bm25_results]
         id_placeholders = ",".join(["%s"] * len(doc_ids))
-        query_sql = sql.SQL(
-            """
-            SELECT id FROM {}
-            WHERE id IN ({}) AND metadata->>'level' = '0'
-            """
-        ).format(
-            sql.Identifier(self.table_name),
-            sql.SQL(id_placeholders),
-        )
+        if self.strict_l0_only:
+            query_sql = sql.SQL(
+                """
+                SELECT id FROM {}
+                WHERE id IN ({})
+                  AND metadata->>'level' = '0'
+                  AND metadata->>'type' = 'L0_base'
+                """
+            ).format(
+                sql.Identifier(self.table_name),
+                sql.SQL(id_placeholders),
+            )
+        else:
+            query_sql = sql.SQL(
+                """
+                SELECT id FROM {}
+                WHERE id IN ({}) AND metadata->>'level' = '0'
+                """
+            ).format(
+                sql.Identifier(self.table_name),
+                sql.SQL(id_placeholders),
+            )
 
         valid_ids = set()
         with self.conn.cursor() as cur:
@@ -658,6 +836,96 @@ class RAGRetriever:
         filtered = [(doc_id, score) for doc_id, score in bm25_results if doc_id in valid_ids]
         if len(filtered) < len(bm25_results):
             print(f"BM25 L0 Filter: {len(bm25_results)} → {len(filtered)}")
+        return filtered
+
+    @staticmethod
+    def _topic_filters_from_metadata(metadata: Dict[str, Any]) -> tuple[List[str], List[str]]:
+        topics = metadata.get("topics", {}) if isinstance(metadata, dict) else {}
+        if not isinstance(topics, dict):
+            topics = {}
+        parent_topics = _as_str_list(
+            topics.get("categories")
+            or metadata.get("expected_parent_topics")
+            or metadata.get("parent_topics")
+        )
+        child_topics = _as_str_list(
+            topics.get("phenomena")
+            or metadata.get("expected_child_topics")
+            or metadata.get("child_topics")
+        )
+        return parent_topics, child_topics
+
+    @staticmethod
+    def _source_like_patterns_from_topics(
+        parent_topics: List[str], child_topics: List[str]
+    ) -> tuple[List[str], List[str]]:
+        parent_patterns = [f"doc/%/{topic}/%" for topic in parent_topics]
+        child_patterns = [f"doc/%/%/{topic}/%" for topic in child_topics]
+        return parent_patterns, child_patterns
+
+    def _bm25_metadata_scope_filter(self, bm25_results, metadata: Dict[str, Any]):
+        """Apply parent/child/family/region scope filters to BM25 results."""
+        if not bm25_results:
+            return bm25_results
+
+        parent_topics, child_topics = self._topic_filters_from_metadata(metadata)
+        family_values = _as_str_list(metadata.get("families") or metadata.get("expected_families"))
+        region_values = _as_str_list(metadata.get("regions") or metadata.get("expected_regions"))
+
+        scope_filters: List[str] = []
+        params: List[Any] = []
+
+        if self.enable_parent_topic_filter and parent_topics:
+            parent_patterns, _ = self._source_like_patterns_from_topics(parent_topics, [])
+            scope_filters.append(
+                "(" + " OR ".join(["metadata->>'source_file' LIKE %s"] * len(parent_patterns)) + ")"
+            )
+            params.extend(parent_patterns)
+
+        if self.enable_child_topic_filter and child_topics:
+            _, child_patterns = self._source_like_patterns_from_topics([], child_topics)
+            scope_filters.append(
+                "(" + " OR ".join(["metadata->>'source_file' LIKE %s"] * len(child_patterns)) + ")"
+            )
+            params.extend(child_patterns)
+
+        if self.enable_family_filter and family_values:
+            placeholders = ",".join(["%s"] * len(family_values))
+            scope_filters.append(
+                f"(metadata->>'family_id' IN ({placeholders}) OR metadata->>'lang_family' IN ({placeholders}))"
+            )
+            params.extend(family_values)
+            params.extend(family_values)
+
+        if self.enable_region_filter and region_values:
+            placeholders = ",".join(["%s"] * len(region_values))
+            scope_filters.append(f"(metadata->>'region' IN ({placeholders}))")
+            params.extend(region_values)
+
+        if not scope_filters:
+            return bm25_results
+
+        doc_ids = [doc_id for doc_id, _ in bm25_results]
+        id_placeholders = ",".join(["%s"] * len(doc_ids))
+        where_scope = " AND ".join(scope_filters)
+
+        query_sql = sql.SQL(
+            f"""
+            SELECT id FROM {{}}
+            WHERE id IN ({id_placeholders})
+              AND {where_scope}
+            """
+        ).format(sql.Identifier(self.table_name))
+
+        valid_ids = set()
+        with self.conn.cursor() as cur:
+            cur.execute(query_sql, tuple(doc_ids + params))
+            for row in cur.fetchall():
+                valid_ids.add(row[0])
+
+        filtered = [(doc_id, score) for doc_id, score in bm25_results if doc_id in valid_ids]
+        if len(filtered) < len(bm25_results):
+            print(f"BM25 Scope Filter: {len(bm25_results)} → {len(filtered)}")
         return filtered
 
     @staticmethod
@@ -713,8 +981,13 @@ class RAGRetriever:
         self._clean_memory()
         print("Embeddings unloaded.")
 
-        threshold_dist = 0.55
-        fetch_k = k * 3
+        threshold_dist = self.distance_threshold
+        if self.candidate_k > 0:
+            fetch_k = self.candidate_k
+        elif (not self.hybrid_enabled) and (not self.use_reranker) and (not self.recursive_enabled):
+            fetch_k = max(1, k)
+        else:
+            fetch_k = max(1, k * 3)
         
         if metadata is None:
             metadata = {}
@@ -738,33 +1011,76 @@ class RAGRetriever:
         diagnostics["enable_language_filter"] = self.enable_language_filter
         diagnostics["viking_use_detected_language"] = self.viking_use_detected_language
         diagnostics["l0_only"] = self.l0_only
+        diagnostics["strict_l0_only"] = self.strict_l0_only
+        diagnostics["metadata_mode"] = self.metadata_mode
         diagnostics["filter_applied"] = False
 
+        sql_filters: List[str] = []
+        sql_params: List[Any] = []
+
         # Build language filter clause
-        lang_filter = ""
-        lang_param = []
-        if self.enable_language_filter and metadata and metadata.get('lang'):
-            lang = metadata['lang']
-            if isinstance(lang, list):
-                # Multi-language query - use IN clause
-                placeholders = ','.join(['%s'] * len(lang))
-                lang_filter = f" AND metadata->>'lang' IN ({placeholders})"
-                lang_param = lang
-                diagnostics["filter_applied"] = True
-                print(f"Applying Multi-Language Filter: {lang}")
+        lang_values = _as_str_list(metadata.get("lang"))
+        if self.enable_language_filter and lang_values:
+            placeholders = ",".join(["%s"] * len(lang_values))
+            sql_filters.append(f"metadata->>'lang' IN ({placeholders})")
+            sql_params.extend(lang_values)
+            diagnostics["filter_applied"] = True
+            if len(lang_values) == 1:
+                print(f"Applying Language Filter: {lang_values[0]}")
             else:
-                # Single language
-                print(f"Applying Language Filter: {lang}")
-                lang_filter = " AND metadata->>'lang' = %s"
-                lang_param = [lang]
-                diagnostics["filter_applied"] = True
+                print(f"Applying Multi-Language Filter: {lang_values}")
         elif metadata and metadata.get("lang") and not self.enable_language_filter:
             print("Language Filter: disabled by retrieval.enable_language_filter=false")
 
-        level_filter = ""
-        if self.l0_only:
-            level_filter = " AND metadata->>'level' = '0'"
+        # Strict L0 means level=0 AND type=L0_base
+        if self.strict_l0_only:
+            sql_filters.append("metadata->>'level' = '0'")
+            sql_filters.append("metadata->>'type' = 'L0_base'")
+            print("Applying strict L0 Filter: metadata.level=0 AND metadata.type=L0_base")
+        elif self.l0_only:
+            sql_filters.append("metadata->>'level' = '0'")
             print("Applying L0-only Filter: metadata.level=0")
+
+        parent_topics, child_topics = self._topic_filters_from_metadata(metadata)
+        diagnostics["detected_topics_categories"] = parent_topics
+        diagnostics["detected_topics_phenomena"] = child_topics
+
+        if self.enable_parent_topic_filter and parent_topics:
+            parent_patterns, _ = self._source_like_patterns_from_topics(parent_topics, [])
+            sql_filters.append(
+                "(" + " OR ".join(["metadata->>'source_file' LIKE %s"] * len(parent_patterns)) + ")"
+            )
+            sql_params.extend(parent_patterns)
+            diagnostics["filter_applied"] = True
+
+        if self.enable_child_topic_filter and child_topics:
+            _, child_patterns = self._source_like_patterns_from_topics([], child_topics)
+            sql_filters.append(
+                "(" + " OR ".join(["metadata->>'source_file' LIKE %s"] * len(child_patterns)) + ")"
+            )
+            sql_params.extend(child_patterns)
+            diagnostics["filter_applied"] = True
+
+        family_values = _as_str_list(metadata.get("families") or metadata.get("expected_families"))
+        if self.enable_family_filter and family_values:
+            placeholders = ",".join(["%s"] * len(family_values))
+            sql_filters.append(
+                f"(metadata->>'family_id' IN ({placeholders}) OR metadata->>'lang_family' IN ({placeholders}))"
+            )
+            sql_params.extend(family_values)
+            sql_params.extend(family_values)
+            diagnostics["filter_applied"] = True
+
+        region_values = _as_str_list(metadata.get("regions") or metadata.get("expected_regions"))
+        if self.enable_region_filter and region_values:
+            placeholders = ",".join(["%s"] * len(region_values))
+            sql_filters.append(f"(metadata->>'region' IN ({placeholders}))")
+            sql_params.extend(region_values)
+            diagnostics["filter_applied"] = True
+
+        where_clause = ""
+        if sql_filters:
+            where_clause = " AND " + " AND ".join(sql_filters)
 
         print(
             "LANG_FILTER_DIAGNOSTICS "
@@ -782,6 +1098,8 @@ class RAGRetriever:
             f"viking_use_detected_language={diagnostics.get('viking_use_detected_language', True)} "
             f"viking_language_seeded={diagnostics.get('viking_language_seeded', False)} "
             f"l0_only={diagnostics.get('l0_only', False)} "
+            f"strict_l0_only={diagnostics.get('strict_l0_only', False)} "
+            f"metadata_mode={diagnostics.get('metadata_mode', 'runtime')} "
             f"filter_applied={diagnostics.get('filter_applied', False)} "
             f"timeout_location={diagnostics.get('timeout_location', 'none')}"
         )
@@ -796,21 +1114,39 @@ class RAGRetriever:
         fallback_level = 0  # 0=initial, 1=category, 2=lang_only, 3=unrestricted
 
         while True:
-            vector_sql = sql.SQL(
-                """
-                SELECT id, content, metadata, (embedding <=> %s::vector) as distance
-                FROM {}
-                WHERE (embedding <=> %s::vector) < %s {} {} {}
-                ORDER BY distance ASC LIMIT %s
-                """
-            ).format(
-                sql.Identifier(self.table_name),
-                sql.SQL(lang_filter),
-                sql.SQL(level_filter),
-                sql.SQL(viking_filter),
-            )
-            vector_params = ([query_vector, query_vector, threshold_dist]
-                             + lang_param + viking_params + [fetch_k])
+            if self.use_distance_threshold:
+                vector_sql = sql.SQL(
+                    """
+                    SELECT id, content, metadata, (embedding <=> %s::vector) as distance
+                    FROM {}
+                    WHERE (embedding <=> %s::vector) < %s {} {}
+                    ORDER BY distance ASC LIMIT %s
+                    """
+                ).format(
+                    sql.Identifier(self.table_name),
+                    sql.SQL(where_clause),
+                    sql.SQL(viking_filter),
+                )
+                vector_params = (
+                    [query_vector, query_vector, threshold_dist]
+                    + sql_params
+                    + viking_params
+                    + [fetch_k]
+                )
+            else:
+                vector_sql = sql.SQL(
+                    """
+                    SELECT id, content, metadata, (embedding <=> %s::vector) as distance
+                    FROM {}
+                    WHERE 1=1 {} {}
+                    ORDER BY distance ASC LIMIT %s
+                    """
+                ).format(
+                    sql.Identifier(self.table_name),
+                    sql.SQL(where_clause),
+                    sql.SQL(viking_filter),
+                )
+                vector_params = [query_vector] + sql_params + viking_params + [fetch_k]
 
             vector_results = []  # [(id, distance)]
             doc_cache = {}       # id -> (content, metadata)
@@ -859,8 +1195,9 @@ class RAGRetriever:
                 print(f"BM25 Search: {len(bm25_results)} matches")
                 if self.l0_only and bm25_results:
                     bm25_results = self._bm25_l0_filter(bm25_results)
-                if self.enable_language_filter and metadata and metadata.get('lang'):
-                    bm25_results = self._bm25_lang_filter(bm25_results, metadata.get('lang'))
+                if self.enable_language_filter and lang_values:
+                    bm25_results = self._bm25_lang_filter(bm25_results, lang_values)
+                bm25_results = self._bm25_metadata_scope_filter(bm25_results, metadata)
                 # In strict mode, pre-filter BM25 to enforce scope purity.
                 # In soft mode, skip pre-filter — let RRF merge freely;
                 # post-fusion _viking_scope_guard handles soft enforcement.
@@ -1133,12 +1470,7 @@ class RAGRetriever:
         # Preserve vector top-5 (using _vector_rank metadata)
         vector_top = [d for d in candidates if d.metadata.get('_vector_rank', 999) < 5]
 
-        print(f"Loading Reranker ({self.reranker_model_name})...")
-        reranker = CrossEncoder(
-            self.reranker_model_name, 
-            device=self.device,
-            trust_remote_code=True
-        )
+        reranker = self._get_reranker()
 
         pairs = []
         truncated_count = 0
@@ -1156,13 +1488,13 @@ class RAGRetriever:
             )
 
         scores = reranker.predict(pairs, batch_size=4)
-        
-        del reranker
-        self._clean_memory()
-        print("Reranker unloaded.")
-        
+
         scored_docs = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
-        top_n_docs = [doc for doc, score in scored_docs[:top_n]]
+        for doc, score in scored_docs:
+            score_value = float(score)
+            doc.metadata["rerank_score"] = score_value
+            doc.metadata["score"] = score_value
+        top_n_docs = [doc for doc, _score in scored_docs[:top_n]]
         
         # Merge preserved vector top with reranked results
         if vector_top:
@@ -1175,6 +1507,14 @@ class RAGRetriever:
             for d in vector_top:
                 key = (d.metadata.get('source_file'), d.metadata.get('chunk_id'))
                 if key not in seen_keys:
+                    if "rerank_score" not in d.metadata:
+                        base_score = d.metadata.get("score")
+                        try:
+                            base_score = float(base_score)
+                        except Exception:
+                            base_score = 0.0
+                        d.metadata["rerank_score"] = base_score
+                        d.metadata["score"] = base_score
                     top_n_docs.append(d)
                     seen_keys.add(key)
                     added += 1
@@ -1270,6 +1610,10 @@ class RAGRetriever:
             f"viking_use_detected_language={diagnostics.get('viking_use_detected_language', True)} "
             f"viking_language_seeded={diagnostics.get('viking_language_seeded', False)} "
             f"l0_only={diagnostics.get('l0_only', False)} "
+            f"strict_l0_only={diagnostics.get('strict_l0_only', False)} "
+            f"metadata_mode={diagnostics.get('metadata_mode', 'runtime')} "
+            f"detected_topics_categories={diagnostics.get('detected_topics_categories', [])} "
+            f"detected_topics_phenomena={diagnostics.get('detected_topics_phenomena', [])} "
             f"filter_applied={diagnostics.get('filter_applied', False)} "
             f"timeout_location={diagnostics.get('timeout_location', 'none')}"
         )

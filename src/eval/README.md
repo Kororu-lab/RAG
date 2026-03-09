@@ -17,7 +17,7 @@ Example run:
 ```bash
 uv run python src/eval/run_ablation.py \
   --queries src/eval/queries_only_example.jsonl \
-  --profiles B0,B1,B2,B3,B4,B5,B6,B7
+  --profiles B0,B1,B2,B3,B4,C1,C2,C3,B5,B6,B7,B8
 ```
 
 Default output directory is `eval/runs/<run_id>/` (override with `--outdir`).
@@ -38,8 +38,16 @@ Recommended fields:
 The rich format supports:
 - retrieval recall at doc/chunk level,
 - per-type slicing (3 groups),
-- language-detection and filter diagnostics analysis.
-- profile ablation (`B0..B6`) and separate E2E track (`B7`).
+- oracle-metadata driven filtering/splitting diagnostics.
+- profile ablation (`B0..B7`) and separate E2E track (`B8`).
+
+Optional oracle metadata fields:
+- `expected_parent_topics`
+- `expected_child_topics`
+- `expected_families`
+- `expected_regions`
+- `needs_split`
+- `split_axes` (`lang`, `topic`, `lang_topic`)
 
 Metrics are reported at `K={5,10,20,30}`:
 - `chunk_recall_at_K`
@@ -47,7 +55,8 @@ Metrics are reported at `K={5,10,20,30}`:
 - `mrr_at_K`
 
 Output layout (per run id):
-- `B0..B6/`: retrieval traces + summaries
-- `B7/`: E2E traces + summaries
+- `B0..B7/`: retrieval traces + summaries
+- `B8/`: E2E traces + summaries
+- `_b5_dev_select/`: dev-only candidate evaluation snapshots (`C1..C3` + parent checks)
 - `retrieval_macro_micro.csv`: retrieval-only aggregates
 - `e2e_macro_micro.csv`: E2E aggregates (separate table)
