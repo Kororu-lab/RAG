@@ -24,6 +24,8 @@ def apply_runtime_overrides(
     viking_max_exp: int,
     retrieval_llm_timeout_sec: int,
     generation_timeout_sec: int,
+    original_evidence_generation_enabled: bool,
+    whole_doc_on_multi_relevant_enabled: bool,
     grading_enabled: bool,
     hallucination_check_enabled: bool,
 ) -> Dict[str, Any]:
@@ -41,7 +43,10 @@ def apply_runtime_overrides(
     retrieval["enable_llm_language_detection"] = bool(language_detection_enabled)
     retrieval["enable_language_filter"] = bool(language_filter_enabled)
     retrieval["viking_use_detected_language"] = bool(viking_use_detected_language_enabled)
-    retrieval.setdefault("hybrid_search", {})["enabled"] = bool(bm25_enabled)
+    hybrid_search = retrieval.setdefault("hybrid_search", {})
+    hybrid_search["enabled"] = bool(bm25_enabled)
+    hybrid_search["mode"] = "dense_bm25_union"
+    hybrid_search["union_bm25_overfetch"] = int(hybrid_search.get("union_bm25_overfetch", 10) or 10)
     retrieval["recursive_retrieval"] = bool(recursive_enabled)
     retrieval["vision_search"] = bool(vision_enabled)
     retrieval["sibling_expansion"] = bool(sibling_expansion_enabled)
@@ -74,11 +79,15 @@ def apply_runtime_overrides(
     viking["max_expansions"] = int(viking_max_exp)
 
     # Reranker override
-    config.setdefault("reranker", {})["enabled"] = bool(reranker_enabled)
+    config.setdefault("reranker", {})["enabled"] = bool(reranker_enabled or bm25_enabled)
 
     # Pipeline controls
     rag = config.setdefault("rag", {})
     rag["generation_timeout_sec"] = int(generation_timeout_sec)
+    rag["original_evidence_generation_enabled"] = bool(original_evidence_generation_enabled)
+    rag["whole_doc_on_multi_relevant_enabled"] = bool(
+        whole_doc_on_multi_relevant_enabled and original_evidence_generation_enabled
+    )
     rag["skip_grading"] = not bool(grading_enabled)
     rag["skip_hallucination"] = not bool(hallucination_check_enabled)
 

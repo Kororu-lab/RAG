@@ -52,6 +52,21 @@ def _load_original_html(source_file: str) -> Tuple[Optional[str], Optional[str],
         return None, f"Failed to read HTML: {e}", resolved
 
 
+def _display_ref_id(doc) -> str:
+    ref_id = str(doc.metadata.get("ref_id", "")).strip()
+    if ref_id:
+        return ref_id
+
+    source_file = str(doc.metadata.get("source_file", "")).strip().replace("\\", "/").lstrip("/")
+    chunk_id = doc.metadata.get("chunk_id")
+    if source_file and chunk_id is not None:
+        parts = [p for p in source_file.split("/") if p]
+        if len(parts) >= 3 and parts[0] == "doc":
+            return f"{parts[1]}/{parts[-1]}:{chunk_id}"
+        return f"{source_file}:{chunk_id}"
+    return "Unknown"
+
+
 st.set_page_config(
     page_title="RAG Agent Web Interface",
     page_icon="🤖",
@@ -72,6 +87,8 @@ with st.sidebar:
     
     # Model Selection
     import src.utils
+    base_config_defaults = src.utils.load_config()
+    base_rag_defaults = dict(base_config_defaults.get("rag", {}) or {})
     model_options = list(dict.fromkeys(MODEL_OPTIONS + st.session_state.extra_model_options))
     default_index = model_options.index(DEFAULT_MODEL) if DEFAULT_MODEL in model_options else 0
 
@@ -100,7 +117,7 @@ with st.sidebar:
     bm25_enabled = st.checkbox("BM25 Hybrid Search", value=True)
     reranker_enabled = st.checkbox("Reranker", value=True)
     recursive_enabled = st.checkbox("Recursive Retrieval", value=True)
-    sibling_expansion_enabled = st.checkbox("Sibling Expansion", value=False)
+    sibling_expansion_enabled = st.checkbox("Sibling Expansion", value=True)
     vision_enabled = st.checkbox("Vision Search", value=False)
     generation_timeout_sec = st.number_input(
         "LLM Timeout (sec, retrieval+generation)",
@@ -133,11 +150,20 @@ with st.sidebar:
     )
 
     st.subheader("Viking Routing")
-    viking_enabled = st.checkbox("Viking Routing", value=False)
+    viking_enabled = st.checkbox("Viking Routing", value=True)
     viking_soft = st.checkbox("Viking Soft Fallback", value=True)
     viking_max_exp = st.number_input("Viking Max Expansions", min_value=0, max_value=5, value=2, step=1)
 
     st.subheader("Pipeline Controls")
+    original_evidence_generation_enabled = st.checkbox(
+        "Original Evidence Generation",
+        value=bool(base_rag_defaults.get("original_evidence_generation_enabled", True)),
+    )
+    whole_doc_on_multi_relevant_enabled = st.checkbox(
+        "Whole Doc on 2+ Relevant Chunks",
+        value=bool(base_rag_defaults.get("whole_doc_on_multi_relevant_enabled", False)),
+        disabled=not original_evidence_generation_enabled,
+    )
     grading_enabled = st.checkbox("Document Grading", value=True)
     hallucination_check_enabled = st.checkbox("Hallucination Check", value=True)
 
@@ -164,6 +190,8 @@ with st.sidebar:
             viking_max_exp=int(viking_max_exp),
             retrieval_llm_timeout_sec=int(generation_timeout_sec),
             generation_timeout_sec=int(generation_timeout_sec),
+            original_evidence_generation_enabled=original_evidence_generation_enabled,
+            whole_doc_on_multi_relevant_enabled=whole_doc_on_multi_relevant_enabled,
             grading_enabled=grading_enabled,
             hallucination_check_enabled=hallucination_check_enabled,
         )
@@ -300,7 +328,8 @@ if prompt := st.chat_input("Enter your query"):
                                 generate_output = value
                                 full_response = value["generation"]
                                 final_answer_found = True
-                                message_placeholder.markdown(full_response)
+                                if not hallucination_check_enabled:
+                                    message_placeholder.markdown(full_response)
 
                             elif key == "check_hallucination":
                                 if hallucination_check_enabled:
@@ -336,7 +365,7 @@ if prompt := st.chat_input("Enter your query"):
             refs = "\n\n**Reference Sources:**\n"
             seen_refs = set()
             for doc in generate_output["documents"]:
-                ref_id = doc.metadata.get('ref_id', 'Unknown')
+                ref_id = _display_ref_id(doc)
                 if ref_id not in seen_refs:
                     level = doc.metadata.get('level', '0')
                     prefix = "Summary" if str(level) == '1' else "Detail"
@@ -351,7 +380,7 @@ if prompt := st.chat_input("Enter your query"):
                 seen_sources = set()
                 for doc in generate_output["documents"]:
                     source_file = str(doc.metadata.get("source_file", "")).strip()
-                    ref_id = doc.metadata.get("ref_id", "Unknown")
+                    ref_id = _display_ref_id(doc)
                     if not source_file or source_file in seen_sources:
                         continue
                     seen_sources.add(source_file)

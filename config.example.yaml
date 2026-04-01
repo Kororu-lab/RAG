@@ -52,13 +52,28 @@ llm_retrieval:
 rag:
   generation_timeout_sec: 600
   grounding_mode: "strict_extractive"       # strict_extractive | balanced
-  answer_format_style: "fluent_with_table"  # fluent_with_table | concise_bullets
+  answer_format_style: "concise_bullets"  # fluent_with_table | concise_bullets
+  explanatory_concise_style_enabled: true   # rollback: false restores the older list-heavy concise generation prompt
+  comparison_table_preference_enabled: true  # rollback: false keeps explanatory style but removes the prompt preference for an optional small comparison table
+  strict_relevance_judge_enabled: true      # rollback: false restores the older permissive relevance gate
+  branch_local_grading_enabled: true        # rollback: false grades all docs against the original merged question only
+  keep_maybe_docs_in_grading: true          # rollback: false drops borderline docs instead of carrying them forward
+  original_evidence_generation_enabled: true
+  surface_example_spans_in_context: true    # rollback: false removes the structured original-example hints
+  whole_doc_on_multi_relevant_enabled: true # rollback: false disables whole-doc evidence expansion
+  whole_doc_min_relevant_chunks: 1          # rollback: set back to 2 for the older behavior
   require_inline_citations: true
-  grounding_min_citation_coverage: 0.85
-  fail_closed_on_guard: false               # false: keep fluent answer + warning, true: replace with safe extractive summary
+  grounding_min_citation_coverage: 0.35
+  claim_count_fail_closed_min_coverage: 0.80  # rollback: set to 1.0 to make claim-count overflow fail-closed more aggressively
+  fail_closed_on_guard: true                # rollback: false restores warning-only pass-through on guard failure
+  readable_fail_closed_response_enabled: true # rollback: false restores the old raw evidence dump fallback
+  enforce_korean_output_for_korean_query: true  # rollback: false disables the Korean-output hard guard
+  minimum_hangul_ratio: 0.10
   hallucination_mode: "two_stage"           # two_stage | legacy
   hallucination_ambiguous_policy: "pass_with_warning"  # pass_with_warning | rewrite
+  skip_checker_on_stage1_pass: true
   skip_rewrite_on_stable_retrieval: true
+  allow_stable_pass_on_catastrophic_guard_fail: false  # rollback: true restores the older stable-pass behavior
   stable_retrieval_jaccard_threshold: 0.9
   max_claims_per_answer: 12
   missing_info_phrase: "정보가 부족합니다"
@@ -84,6 +99,8 @@ retrieval:
   viking_use_detected_language: true
   recursive_retrieval: true  # Expand L1 summaries to L0 chunks
   sibling_expansion: false   # Keep OFF by default for fair ablations
+  topic_scope_original_rescue_enabled: true   # rollback: false disables direct original-content rescue for poisoned summary rows
+  topic_scope_original_rescue_max_docs: 8     # rollback: lower or disable if rescue proves too broad
   vision_search: false       # ColPali vision search for tables/images
   query_split:
     enabled: true
@@ -91,9 +108,8 @@ retrieval:
     branch_k_mode: "full_per_branch" # balanced | full_per_branch
   hybrid_search:
     enabled: true
-    vector_weight: 0.6
-    bm25_weight: 0.4
-    rrf_k: 60
+    mode: "dense_bm25_union"
+    union_bm25_overfetch: 10
     index_path: "data/bm25_index.pkl"
   viking:
     enabled: false        # OpenViking-style hierarchy routing (restricts search space)

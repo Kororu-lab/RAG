@@ -1,6 +1,7 @@
 
 import os
 import sys
+import fnmatch
 
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
@@ -34,7 +35,7 @@ except ImportError as e:
     ColPaliRetriever = None
 
 try:
-    from src.retrieve.bm25_search import BM25Index, reciprocal_rank_fusion
+    from src.retrieve.bm25_search import BM25Index
     BM25_AVAILABLE = True
 except ImportError as e:
     print(f"BM25 not available: {e}")
@@ -609,13 +610,31 @@ class RAGRetriever:
         # Hybrid search config
         hybrid_cfg = self.config.get("retrieval", {}).get("hybrid_search", {})
         self.hybrid_enabled = hybrid_cfg.get("enabled", False) and BM25_AVAILABLE
+        requested_hybrid_mode = str(
+            hybrid_cfg.get("mode", "dense_bm25_union") or "dense_bm25_union"
+        ).strip().lower()
+        if requested_hybrid_mode != "dense_bm25_union":
+            print(
+                f"Hybrid mode '{requested_hybrid_mode}' is deprecated; "
+                "using 'dense_bm25_union' instead."
+            )
+        self.hybrid_mode = "dense_bm25_union"
         self.vector_weight = hybrid_cfg.get("vector_weight", 0.6)
         self.bm25_weight = hybrid_cfg.get("bm25_weight", 0.4)
         self.rrf_k = hybrid_cfg.get("rrf_k", 60)
+        self.hybrid_union_bm25_overfetch = max(
+            0, int(hybrid_cfg.get("union_bm25_overfetch", 10))
+        )
         self.bm25_index_path = hybrid_cfg.get("index_path", "data/bm25_index.pkl")
+        if self.hybrid_enabled and not self.use_reranker:
+            print("Hybrid Search now requires reranker; forcing reranker enabled.")
+            self.use_reranker = True
         
         if self.hybrid_enabled:
-            print(f"Hybrid Search: enabled (vector={self.vector_weight}, bm25={self.bm25_weight})")
+            print(
+                "Hybrid Search: enabled "
+                f"(mode={self.hybrid_mode}, union_bm25_overfetch={self.hybrid_union_bm25_overfetch})"
+            )
         
         # Vision and recursive retrieval config
         retrieval_cfg = self.config.get("retrieval", {})
@@ -636,6 +655,12 @@ class RAGRetriever:
         self.vision_enabled = retrieval_cfg.get("vision_search", False)
         self.recursive_enabled = retrieval_cfg.get("recursive_retrieval", True)
         self.sibling_expansion = bool(retrieval_cfg.get("sibling_expansion", False))
+        self.topic_scope_original_rescue_enabled = bool(
+            retrieval_cfg.get("topic_scope_original_rescue_enabled", True)
+        )
+        self.topic_scope_original_rescue_max_docs = max(
+            1, int(retrieval_cfg.get("topic_scope_original_rescue_max_docs", 8))
+        )
 
         # Viking routing config
         viking_cfg = retrieval_cfg.get("viking", {})
@@ -757,6 +782,33 @@ class RAGRetriever:
         if len(filtered) < len(bm25_results):
             print(f"Viking BM25 Filter: {len(bm25_results)} → {len(filtered)}")
         return filtered
+
+    @staticmethod
+    def _build_dense_bm25_union_ids(
+        vector_results,
+        bm25_results,
+        dense_keep: int,
+        target_total: int,
+    ):
+        """Preserve dense top-K, then append unique BM25 hits until target_total."""
+        ordered_ids = []
+        seen_ids = set()
+
+        for doc_id, _score in vector_results[:dense_keep]:
+            if doc_id in seen_ids:
+                continue
+            ordered_ids.append(doc_id)
+            seen_ids.add(doc_id)
+
+        for doc_id, _score in bm25_results:
+            if len(ordered_ids) >= target_total:
+                break
+            if doc_id in seen_ids:
+                continue
+            ordered_ids.append(doc_id)
+            seen_ids.add(doc_id)
+
+        return ordered_ids
 
     def _bm25_lang_filter(self, bm25_results, lang_filter_value):
         """Apply metadata->>'lang' filter to BM25 results before RRF merge."""
@@ -965,6 +1017,95 @@ class RAGRetriever:
         print(f"Viking Scope Guard (soft): kept {len(out_scope)} out-of-scope "
               f"(only {len(in_scope)} in-scope)")
         return in_scope + out_scope
+
+    @staticmethod
+    def _matches_source_patterns(doc: Document, patterns: List[str]) -> bool:
+        if not patterns:
+            return False
+        src = str(doc.metadata.get("source_file", "") or "")
+        for pattern in patterns:
+            glob_pat = str(pattern).replace("%", "*")
+            if fnmatch.fnmatch(src, glob_pat):
+                return True
+        return False
+
+    def _topic_scope_original_rescue(
+        self,
+        docs: List[Document],
+        metadata: Dict[str, Any],
+    ) -> List[Document]:
+        """Rescue high-confidence topic docs when summary-first retrieval misses them.
+
+        This is a narrow runtime fallback for cases where vector/BM25 candidates never
+        include the scoped topic rows because the stored summary text is corrupted or
+        semantically off-topic, while the original_content/source_file are still valid.
+        """
+        if not self.topic_scope_original_rescue_enabled or not isinstance(metadata, dict):
+            return docs
+
+        _parent_topics, child_topics = self._topic_filters_from_metadata(metadata)
+        if not child_topics:
+            return docs
+
+        _parent_patterns, child_patterns = self._source_like_patterns_from_topics([], child_topics)
+        if not child_patterns:
+            return docs
+
+        if any(self._matches_source_patterns(doc, child_patterns) for doc in docs):
+            return docs
+
+        lang_values = _as_lang_list(metadata.get("lang"))
+        lang_placeholders = ",".join(["%s"] * len(lang_values)) if lang_values else ""
+        child_clauses = " OR ".join(["metadata->>'source_file' LIKE %s"] * len(child_patterns))
+
+        sql_parts = [
+            "SELECT content, metadata FROM {}",
+            "WHERE metadata->>'level' = '0'",
+            "AND metadata->>'type' = 'L0_base'",
+            f"AND ({child_clauses})",
+        ]
+        params: List[Any] = list(child_patterns)
+        if lang_values:
+            sql_parts.append(f"AND metadata->>'lang' IN ({lang_placeholders})")
+            params.extend(lang_values)
+        sql_parts.append(
+            "ORDER BY metadata->>'source_file' ASC, (metadata->>'chunk_id')::int ASC LIMIT %s"
+        )
+        params.append(self.topic_scope_original_rescue_max_docs)
+
+        query_sql = sql.SQL("\n".join(sql_parts)).format(sql.Identifier(self.table_name))
+
+        rescued: List[Document] = []
+        with self.conn.cursor() as cur:
+            cur.execute(query_sql, tuple(params))
+            for content, meta in cur.fetchall():
+                actual_content = meta.get("original_content", content)
+                doc = Document(page_content=actual_content, metadata=meta)
+                doc.metadata["_topic_scope_original_rescue"] = True
+                doc.metadata["_vector_rank"] = 10**9
+                doc.metadata["score"] = float(doc.metadata.get("score", 0.0) or 0.0)
+                rescued.append(doc)
+
+        if not rescued:
+            return docs
+
+        existing_keys = {
+            (doc.metadata.get("source_file"), doc.metadata.get("chunk_id"))
+            for doc in docs
+        }
+        added: List[Document] = []
+        for doc in rescued:
+            key = (doc.metadata.get("source_file"), doc.metadata.get("chunk_id"))
+            if key not in existing_keys:
+                added.append(doc)
+                existing_keys.add(key)
+
+        if added:
+            print(
+                "Original Content Topic Rescue: "
+                f"added {len(added)} docs for child_topics={child_topics}"
+            )
+        return docs + added
 
     def retrieve_text(self, query: str, k: int, metadata: Dict[str, Any] = None,
                       viking_scope=None):
@@ -1191,7 +1332,10 @@ class RAGRetriever:
         if self.hybrid_enabled:
             try:
                 bm25_index = BM25Index(self.bm25_index_path)
-                bm25_results = bm25_index.search(query, top_k=fetch_k)
+                bm25_fetch_k = fetch_k
+                if self.hybrid_mode == "dense_bm25_union":
+                    bm25_fetch_k = fetch_k + self.hybrid_union_bm25_overfetch
+                bm25_results = bm25_index.search(query, top_k=bm25_fetch_k)
                 print(f"BM25 Search: {len(bm25_results)} matches")
                 if self.l0_only and bm25_results:
                     bm25_results = self._bm25_l0_filter(bm25_results)
@@ -1208,50 +1352,60 @@ class RAGRetriever:
         
         # 3. Merge results
         if self.hybrid_enabled and bm25_results:
-            # RRF Fusion
-            rrf_scores = reciprocal_rank_fusion(
-                vector_results, bm25_results,
-                k=self.rrf_k,
-                vector_weight=self.vector_weight,
-                bm25_weight=self.bm25_weight
-            )
-            
-            # Sort by RRF score
-            sorted_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
-            
-            # Fetch any docs from BM25 not in cache
-            missing_ids = [doc_id for doc_id in sorted_ids if doc_id not in doc_cache]
-            if missing_ids:
-                placeholders = ','.join(['%s'] * len(missing_ids))
-                with self.conn.cursor() as cur:
-                    query_sql = sql.SQL(
-                        """
-                        SELECT id, content, metadata FROM {}
-                        WHERE id IN ({})
-                        """
-                    ).format(
-                        sql.Identifier(self.table_name),
-                        sql.SQL(placeholders),
-                    )
-                    cur.execute(query_sql, tuple(missing_ids))
-                    for row in cur.fetchall():
-                        doc_id, content, meta = row
-                        doc_cache[doc_id] = (content, meta)
-            
-            # Build final doc list
-            text_docs = []
-            for doc_id in sorted_ids[:fetch_k]:
-                if doc_id not in doc_cache:
-                    continue
-                content, meta = doc_cache[doc_id]
-                actual_content = meta.get('original_content', content)
-                doc = Document(page_content=actual_content, metadata=meta)
-                doc.metadata['score'] = rrf_scores[doc_id]
-                doc.metadata['_db_id'] = doc_id
-                doc.metadata['_vector_rank'] = vector_ranks.get(doc_id, 999)  # Preserve vector rank
-                text_docs.append(doc)
-            
-            print(f"Hybrid Search (RRF): {len(text_docs)} merged results")
+            bm25_ranks = {doc_id: rank for rank, (doc_id, _score) in enumerate(bm25_results)}
+            if self.hybrid_mode == "dense_bm25_union":
+                dense_keep = min(len(vector_results), fetch_k)
+                target_total = max(fetch_k, dense_keep * 2)
+                sorted_ids = self._build_dense_bm25_union_ids(
+                    vector_results=vector_results,
+                    bm25_results=bm25_results,
+                    dense_keep=dense_keep,
+                    target_total=target_total,
+                )
+
+                missing_ids = [doc_id for doc_id in sorted_ids if doc_id not in doc_cache]
+                if missing_ids:
+                    placeholders = ','.join(['%s'] * len(missing_ids))
+                    with self.conn.cursor() as cur:
+                        query_sql = sql.SQL(
+                            """
+                            SELECT id, content, metadata FROM {}
+                            WHERE id IN ({})
+                            """
+                        ).format(
+                            sql.Identifier(self.table_name),
+                            sql.SQL(placeholders),
+                        )
+                        cur.execute(query_sql, tuple(missing_ids))
+                        for row in cur.fetchall():
+                            doc_id, content, meta = row
+                            doc_cache[doc_id] = (content, meta)
+
+                text_docs = []
+                dense_ids = {doc_id for doc_id, _score in vector_results[:dense_keep]}
+                for doc_id in sorted_ids:
+                    if doc_id not in doc_cache:
+                        continue
+                    content, meta = doc_cache[doc_id]
+                    actual_content = meta.get('original_content', content)
+                    doc = Document(page_content=actual_content, metadata=meta)
+                    doc.metadata['_db_id'] = doc_id
+                    doc.metadata['_vector_rank'] = vector_ranks.get(doc_id, 999)
+                    doc.metadata['_bm25_rank'] = bm25_ranks.get(doc_id, 999)
+                    doc.metadata['_hybrid_source'] = 'vector' if doc_id in dense_ids else 'bm25'
+                    doc.metadata['score'] = float(vector_ranks.get(doc_id, 0))
+                    text_docs.append(doc)
+
+                added_bm25 = sum(
+                    1 for doc in text_docs if doc.metadata.get('_hybrid_source') == 'bm25'
+                )
+                print(
+                    "Hybrid Search (Dense+BM25 Union): "
+                    f"dense={dense_keep} "
+                    f"bm25_added={added_bm25} "
+                    f"merged={len(text_docs)} "
+                    f"target={target_total}"
+                )
         else:
             # Vector-only fallback
             text_docs = []
@@ -1270,6 +1424,7 @@ class RAGRetriever:
         
         # Post-fusion Viking scope guard
         text_docs = self._viking_scope_guard(text_docs, viking_scope, self.viking_mode)
+        text_docs = self._topic_scope_original_rescue(text_docs, metadata or {})
 
         return self._recursive_expand(text_docs)
 

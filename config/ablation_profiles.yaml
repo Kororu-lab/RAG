@@ -84,7 +84,7 @@ profiles:
       query_split:
         enabled: false
   B2:
-    description: Hybrid baseline (B1 + BM25/RRF only).
+    description: Dense + BM25 lexical augmentation + reranker (dense preserved, BM25 union before rerank).
     database:
       dbname: ltdb_rag
       table_name: linguistics_raptor
@@ -95,11 +95,16 @@ profiles:
       recursive_retrieval: false
       hybrid_search:
         enabled: true
+        mode: dense_bm25_union
+        union_bm25_overfetch: 10
       enable_language_filter: false
       enable_parent_topic_filter: false
       enable_child_topic_filter: false
       query_split:
         enabled: false
+    reranker:
+      enabled: true
+      top_n: 30
   B3:
     description: RAPTOR retrieval baseline (B1 + recursive L1->L0, no BM25).
     database:
@@ -139,11 +144,15 @@ profiles:
       query_split:
         enabled: false
   B6:
-    description: B4 + reranker (global post-merge rerank).
+    description: B4 + BM25 lexical augmentation + reranker (dense preserved, BM25 union before rerank).
     ablation:
       base_profile: B4
       run_mode: retrieval
     retrieval:
+      hybrid_search:
+        enabled: true
+        mode: dense_bm25_union
+        union_bm25_overfetch: 10
       query_split:
         enabled: false
     reranker:
@@ -151,7 +160,8 @@ profiles:
       top_n: 30
   B7:
     description: 'Finalized paper-facing B7: physically materialized language split
-      with recovered front-door, hard-seeded local B6 branches, and post-merge rerank.'
+      with recovered front-door, hard-seeded local B6 branches, BM25 lexical
+      augmentation, and post-merge rerank.'
     ablation:
       base_profile: B4
       run_mode: retrieval
@@ -166,7 +176,9 @@ profiles:
       enable_family_filter: false
       enable_region_filter: false
       hybrid_search:
-        enabled: false
+        enabled: true
+        mode: dense_bm25_union
+        union_bm25_overfetch: 10
       query_split:
         enabled: true
         controller_mode: t71_materialized_language_local_b6
@@ -180,6 +192,9 @@ profiles:
         post_merge_rerank_mode: global
         language_diversity_guard_enabled: true
         language_diversity_min_per_branch: 1
+    reranker:
+      enabled: true
+      top_n: 30
     reranker:
       enabled: true
       top_n: 30

@@ -9,6 +9,9 @@ from langchain_core.documents import Document
 
 from src.eval.materialized_language_split import materialize_language_split_plan
 from src.eval.metadata_store import MetadataStore
+from src.eval.query_topic_detection import (
+    detect_topics_from_query_with_scores as _shared_detect_topics_from_query_with_scores,
+)
 from src.retrieve.rag_retrieve import RAGRetriever
 
 
@@ -421,66 +424,12 @@ def _detect_topics_from_query_with_scores(
     category_lexicon: Dict[str, str],
     metadata_store: MetadataStore | None,
 ) -> Dict[str, Any]:
-    q = str(query_text).strip().lower()
-    if not q:
-        return {
-            "parent_topics": [],
-            "child_topics": [],
-            "parent_topic_scores": {},
-            "child_topic_scores": {},
-            "parent_topics_high": [],
-            "child_topics_high": [],
-        }
-
-    parent_scores: Dict[str, float] = {}
-    child_scores: Dict[str, float] = {}
-
-    def _bump(store: Dict[str, float], key: str, value: float) -> None:
-        if not key:
-            return
-        store[key] = store.get(key, 0.0) + float(value)
-
-    for term, ids in phenomenon_lexicon.items():
-        term_lower = str(term).strip().lower()
-        if _contains_term(q, term_lower):
-            for pid in ids:
-                _bump(child_scores, str(pid), 1.0)
-
-    for term, cat_id in category_lexicon.items():
-        term_lower = str(term).strip().lower()
-        if _contains_term(q, term_lower):
-            _bump(parent_scores, str(cat_id), 1.0)
-
-    for topic_id in re.findall(r"\b\d{2}_[a-z0-9_]+\b", q):
-        _bump(child_scores, topic_id, 3.0)
-    for topic_id in re.findall(r"\b\d_[a-z0-9_]+\b", q):
-        _bump(parent_scores, topic_id, 3.0)
-
-    if metadata_store:
-        known_parent = {t for arr in metadata_store.parent_topics_by_lang.values() for t in arr}
-        known_child = {t for arr in metadata_store.child_topics_by_lang.values() for t in arr}
-        for topic_id in sorted(known_parent):
-            if _contains_term(q, topic_id.lower()):
-                _bump(parent_scores, topic_id, 1.5)
-        for topic_id in sorted(known_child):
-            if _contains_term(q, topic_id.lower()):
-                _bump(child_scores, topic_id, 1.5)
-
-    ordered_parent = sorted(parent_scores.items(), key=lambda kv: (-kv[1], kv[0]))
-    ordered_child = sorted(child_scores.items(), key=lambda kv: (-kv[1], kv[0]))
-    parent_topics = [topic for topic, _score in ordered_parent]
-    child_topics = [topic for topic, _score in ordered_child]
-    parent_topics_high = [topic for topic, score in ordered_parent if score >= 2.0]
-    child_topics_high = [topic for topic, score in ordered_child if score >= 2.0]
-
-    return {
-        "parent_topics": parent_topics,
-        "child_topics": child_topics,
-        "parent_topic_scores": {topic: round(score, 4) for topic, score in ordered_parent},
-        "child_topic_scores": {topic: round(score, 4) for topic, score in ordered_child},
-        "parent_topics_high": parent_topics_high,
-        "child_topics_high": child_topics_high,
-    }
+    return _shared_detect_topics_from_query_with_scores(
+        query_text=query_text,
+        phenomenon_lexicon=phenomenon_lexicon,
+        category_lexicon=category_lexicon,
+        metadata_store=metadata_store,
+    )
 
 
 def build_query_only_metadata(

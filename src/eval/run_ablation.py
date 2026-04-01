@@ -37,12 +37,19 @@ from src.eval.materialized_language_split import (
 )
 from src.eval.metadata_store import MetadataStore, load_metadata_store
 from src.eval.metrics import aggregate_macro_micro, build_gold_sets, compute_query_metrics
+from src.eval.query_topic_detection import (
+    detect_topics_from_query_with_scores as _shared_detect_topics_from_query_with_scores,
+)
 from src.eval.profiles import (
+    FILTERING_MODE_CHOICES,
+    FILTERING_MODE_DEFAULT,
     RERANK_K30_PROFILES,
     RERANK_MIN_TOP_N_FOR_K30,
     deep_merge,
     load_profile_file,
+    profile_base_chain,
     resolve_profile_config,
+    resolve_profile_overrides,
     select_profiles,
 )
 from src.retrieve.rag_retrieve import RAGRetriever, extract_query_metadata
@@ -764,68 +771,12 @@ def _detect_topics_from_query_with_scores(
     category_lexicon: Dict[str, str],
     metadata_store: MetadataStore | None,
 ) -> dict[str, Any]:
-    q = str(query_text).strip().lower()
-    if not q:
-        return {
-            "parent_topics": [],
-            "child_topics": [],
-            "parent_topic_scores": {},
-            "child_topic_scores": {},
-            "parent_topics_high": [],
-            "child_topics_high": [],
-        }
-
-    parent_scores: Dict[str, float] = {}
-    child_scores: Dict[str, float] = {}
-
-    def _bump(store: Dict[str, float], key: str, value: float) -> None:
-        if not key:
-            return
-        store[key] = store.get(key, 0.0) + float(value)
-
-    for term, ids in phenomenon_lexicon.items():
-        term_lower = str(term).strip().lower()
-        if _contains_term(q, term_lower):
-            for pid in ids:
-                _bump(child_scores, str(pid), 1.0)
-
-    for term, cat_id in category_lexicon.items():
-        term_lower = str(term).strip().lower()
-        if _contains_term(q, term_lower):
-            _bump(parent_scores, str(cat_id), 1.0)
-
-    # Direct ID mentions in query get stronger confidence.
-    for topic_id in re.findall(r"\b\d{2}_[a-z0-9_]+\b", q):
-        _bump(child_scores, topic_id, 3.0)
-    for topic_id in re.findall(r"\b\d_[a-z0-9_]+\b", q):
-        _bump(parent_scores, topic_id, 3.0)
-
-    # Metadata registry ID fallback (query-only string match, no oracle usage).
-    if metadata_store:
-        known_parent = {t for arr in metadata_store.parent_topics_by_lang.values() for t in arr}
-        known_child = {t for arr in metadata_store.child_topics_by_lang.values() for t in arr}
-        for topic_id in sorted(known_parent):
-            if _contains_term(q, topic_id.lower()):
-                _bump(parent_scores, topic_id, 1.5)
-        for topic_id in sorted(known_child):
-            if _contains_term(q, topic_id.lower()):
-                _bump(child_scores, topic_id, 1.5)
-
-    ordered_parent = sorted(parent_scores.items(), key=lambda kv: (-kv[1], kv[0]))
-    ordered_child = sorted(child_scores.items(), key=lambda kv: (-kv[1], kv[0]))
-    parent_topics = [topic for topic, _score in ordered_parent]
-    child_topics = [topic for topic, _score in ordered_child]
-    parent_topics_high = [topic for topic, score in ordered_parent if score >= 2.0]
-    child_topics_high = [topic for topic, score in ordered_child if score >= 2.0]
-
-    return {
-        "parent_topics": parent_topics,
-        "child_topics": child_topics,
-        "parent_topic_scores": {topic: round(score, 4) for topic, score in ordered_parent},
-        "child_topic_scores": {topic: round(score, 4) for topic, score in ordered_child},
-        "parent_topics_high": parent_topics_high,
-        "child_topics_high": child_topics_high,
-    }
+    return _shared_detect_topics_from_query_with_scores(
+        query_text=query_text,
+        phenomenon_lexicon=phenomenon_lexicon,
+        category_lexicon=category_lexicon,
+        metadata_store=metadata_store,
+    )
 
 
 def _build_query_only_metadata(
@@ -1065,7 +1016,7 @@ def _top_chunks_snapshot(docs: Sequence[Document], limit: int = 10) -> List[Dict
 
 def _derive_group_label(query_id: str, query_type: str) -> str:
     prefix = str(query_id).split("_", 1)[0].strip().upper()
-    if prefix in {"T1", "T2", "T3"}:
+    if prefix in {"T1", "T2", "T3", "T4", "T5", "T6"}:
         return prefix
     mapping = {
         "single_lang_single_topic": "T1",
@@ -1073,6 +1024,13 @@ def _derive_group_label(query_id: str, query_type: str) -> str:
         "single_lang_multi_topic": "T3",
     }
     return mapping.get(str(query_type or ""), "UNKNOWN")
+
+
+def _row_group_label(row: Dict[str, Any]) -> str:
+    return _derive_group_label(
+        str(row.get("query_id", "")),
+        str(row.get("query_type", "unknown")),
+    ) if not str(row.get("group_label", "") or "").strip() else str(row.get("group_label", "")).strip().upper()
 
 
 def _build_split_branch_metadata(
@@ -2945,6 +2903,10 @@ def _build_query_row_base(
         "profile": profile,
         "query_id": query_item["query_id"],
         "query_type": query_item.get("query_type", "unknown"),
+        "group_label": _derive_group_label(
+            str(query_item.get("query_id", "")),
+            str(query_item.get("query_type", "unknown")),
+        ),
         "query_text": query_item["query"],
         "timestamp": _utc_now(),
         "db_name": db_name,
@@ -3223,6 +3185,10 @@ def _run_e2e_profile(
                 "profile": profile_name,
                 "query_id": query_item["query_id"],
                 "query_type": query_item.get("query_type", "unknown"),
+                "group_label": _derive_group_label(
+                    str(query_item.get("query_id", "")),
+                    str(query_item.get("query_type", "unknown")),
+                ),
                 "query_text": query_text,
                 "timestamp": _utc_now(),
                 "db_name": db_name,
@@ -3275,6 +3241,10 @@ def _run_e2e_profile(
                 "profile": profile_name,
                 "query_id": query_item["query_id"],
                 "query_type": query_item.get("query_type", "unknown"),
+                "group_label": _derive_group_label(
+                    str(query_item.get("query_id", "")),
+                    str(query_item.get("query_type", "unknown")),
+                ),
             }
             first_row.update(first_metrics)
             first_metric_rows.append(first_row)
@@ -3283,6 +3253,10 @@ def _run_e2e_profile(
                 "profile": profile_name,
                 "query_id": query_item["query_id"],
                 "query_type": query_item.get("query_type", "unknown"),
+                "group_label": _derive_group_label(
+                    str(query_item.get("query_id", "")),
+                    str(query_item.get("query_type", "unknown")),
+                ),
             }
             final_row.update(final_metrics)
             final_metric_rows.append(final_row)
@@ -3324,29 +3298,42 @@ def _split_dev_test_queries(
     seed: int = 20260304,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, List[str]]]:
     target_groups = {
-        "single_lang_single_topic": 15,
-        "multi_lang_single_topic": 15,
-        "single_lang_multi_topic": 15,
+        "T1": 15,
+        "T2": 15,
+        "T3": 15,
     }
     rng = random.Random(seed)
     by_group: Dict[str, List[Dict[str, Any]]] = {k: [] for k in target_groups}
     for q in queries:
-        q_type = str(q.get("query_type", "unknown"))
-        if q_type in by_group:
-            by_group[q_type].append(q)
+        group_label = _derive_group_label(
+            str(q.get("query_id", "")),
+            str(q.get("query_type", "unknown")),
+        )
+        if group_label in {"T4", "T5", "T6"}:
+            by_group.setdefault(group_label, []).append(q)
+        elif group_label in by_group:
+            by_group[group_label].append(q)
+
+    # Preserve the legacy 45-query dev slice for T1-T3, but include all extra
+    # groups when they exist so downstream selection and reporting do not erase
+    # T4-T6 entirely.
+    for group_label in ("T4", "T5", "T6"):
+        pool = by_group.get(group_label, [])
+        if pool:
+            target_groups[group_label] = len(pool)
 
     selected: List[Dict[str, Any]] = []
     selected_ids_by_group: Dict[str, List[str]] = {}
-    for q_type, n in target_groups.items():
-        pool = sorted(by_group.get(q_type, []), key=lambda x: str(x.get("query_id", "")))
+    for group_label, n in target_groups.items():
+        pool = sorted(by_group.get(group_label, []), key=lambda x: str(x.get("query_id", "")))
         if len(pool) < n:
             raise ValueError(
-                f"Balanced dev45 build failed: group={q_type} needs {n}, found {len(pool)}"
+                f"Balanced dev build failed: group={group_label} needs {n}, found {len(pool)}"
             )
         chosen = rng.sample(pool, n)
         chosen = sorted(chosen, key=lambda x: str(x.get("query_id", "")))
         selected.extend(chosen)
-        selected_ids_by_group[q_type] = [str(x.get("query_id", "")) for x in chosen]
+        selected_ids_by_group[group_label] = [str(x.get("query_id", "")) for x in chosen]
 
     selected_ids = {str(q.get("query_id", "")) for q in selected}
     final_queries = [q for q in queries]
@@ -3357,8 +3344,8 @@ def _split_dev_test_queries(
 def _macro_metric(summary_rows: List[Dict[str, Any]], metric_key: str) -> float:
     by_type: Dict[str, List[float]] = {}
     for row in summary_rows:
-        q_type = str(row.get("query_type", "unknown"))
-        by_type.setdefault(q_type, []).append(float(row.get(metric_key, 0.0)))
+        group_label = _row_group_label(row)
+        by_type.setdefault(group_label, []).append(float(row.get(metric_key, 0.0)))
     if not by_type:
         return 0.0
     per_type_values = []
@@ -3374,11 +3361,11 @@ def _macro_metric(summary_rows: List[Dict[str, Any]], metric_key: str) -> float:
 def _group_metric(summary_rows: List[Dict[str, Any]], metric_key: str) -> Dict[str, float]:
     by_type: Dict[str, List[float]] = {}
     for row in summary_rows:
-        q_type = str(row.get("query_type", "unknown"))
-        by_type.setdefault(q_type, []).append(float(row.get(metric_key, 0.0)))
+        group_label = _row_group_label(row)
+        by_type.setdefault(group_label, []).append(float(row.get(metric_key, 0.0)))
     out: Dict[str, float] = {}
-    for q_type, values in by_type.items():
-        out[q_type] = (sum(values) / float(len(values))) if values else 0.0
+    for group_label, values in by_type.items():
+        out[group_label] = (sum(values) / float(len(values))) if values else 0.0
     return out
 
 
@@ -3438,10 +3425,10 @@ def _profile_metric_lookup(
 
 
 def _groupwise_metrics(summary_rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
-    groups = sorted({str(r.get("query_type", "unknown")) for r in summary_rows})
+    groups = sorted({_row_group_label(r) for r in summary_rows})
     out: Dict[str, Dict[str, float]] = {}
     for g in groups:
-        rows = [r for r in summary_rows if str(r.get("query_type", "unknown")) == g]
+        rows = [r for r in summary_rows if _row_group_label(r) == g]
         if not rows:
             continue
         out[g] = {
@@ -3781,6 +3768,16 @@ def main() -> None:
         help="Override fixed_top_n for all profiles.",
     )
     parser.add_argument(
+        "--filtering",
+        choices=sorted(FILTERING_MODE_CHOICES),
+        default=FILTERING_MODE_DEFAULT,
+        help=(
+            "Filtering mode for B4/B6/B7. "
+            "Default 'viking' enables Viking-scoped filtering; "
+            "'metadata' restores the previous metadata-only behavior."
+        ),
+    )
+    parser.add_argument(
         "--b5-frozen-candidate",
         default="",
         help="Optional fixed B5 candidate profile (C1/C2/C3). Skips dev selection when set.",
@@ -3808,6 +3805,7 @@ def main() -> None:
         "query_file": str(Path(args.queries)),
         "query_count": len(queries),
         "profile_config": str(profile_path),
+        "filtering_mode": args.filtering,
         "profiles_planned": selected_profiles,
         "profiles_results": [],
     }
@@ -3824,8 +3822,11 @@ def main() -> None:
         final_queries = list(queries)
         by_group: Dict[str, List[str]] = {}
         for q in queries:
-            q_type = str(q.get("query_type", "unknown"))
-            by_group.setdefault(q_type, []).append(str(q.get("query_id", "")))
+            group_label = _derive_group_label(
+                str(q.get("query_id", "")),
+                str(q.get("query_type", "unknown")),
+            )
+            by_group.setdefault(group_label, []).append(str(q.get("query_id", "")))
         dev_ids_by_group = by_group
         explicit_split_used = True
     run_meta["dev_query_count"] = len(dev_queries)
@@ -3838,8 +3839,8 @@ def main() -> None:
     _write_csv(
         out_dir / "balanced_dev45_query_ids.csv",
         [
-            {"query_type": q_type, "query_id": qid}
-            for q_type, qids in dev_ids_by_group.items()
+            {"group_label": group_label, "query_id": qid}
+            for group_label, qids in dev_ids_by_group.items()
             for qid in qids
         ],
     )
@@ -3852,6 +3853,7 @@ def main() -> None:
             profile_overrides=profile_overrides,
             fixed_k=args.fixed_k,
             fixed_top_n=args.fixed_top_n,
+            filtering_mode=args.filtering,
         )
         llm_retrieval_cfg = cfg.setdefault("llm_retrieval", {})
         timeout_cfg_value = _safe_int(llm_retrieval_cfg.get("request_timeout_sec", 600), 600)
@@ -3918,20 +3920,23 @@ def main() -> None:
     profile_summary_rows: Dict[str, List[Dict[str, Any]]] = {}
 
     for profile_name in selected_profiles:
-        profile_overrides = deepcopy(profiles_map.get(profile_name) or {})
-        description = str(profile_overrides.pop("description", ""))
+        profile_entry = deepcopy(profiles_map.get(profile_name) or {})
+        description = str(profile_entry.get("description", ""))
         effective_profile_name = profile_name
+        base_chain = []
         base_profile_name = _base_profile_for(profile_name)
         if base_profile_name:
-            base_profile_overrides = deepcopy(profiles_map.get(base_profile_name) or {})
-            base_profile_overrides.pop("description", None)
-            profile_overrides = deep_merge(base_profile_overrides, profile_overrides)
-            description = f"{description} (base={base_profile_name})".strip()
+            base_chain = [*profile_base_chain(profiles_map, profile_name)]
+            profile_overrides = resolve_profile_overrides(profiles_map, profile_name)
+            description = f"{description} (base={'->'.join(base_chain)})".strip()
         elif frozen_b5_candidate and frozen_b5_candidate in profiles_map and profile_name in {"B5", "B6", "B7", "B8"}:
-            base_candidate_overrides = deepcopy(profiles_map.get(frozen_b5_candidate) or {})
-            base_candidate_overrides.pop("description", None)
-            profile_overrides = deep_merge(base_candidate_overrides, profile_overrides)
+            profile_entry.pop("description", None)
+            profile_overrides = resolve_profile_overrides(profiles_map, frozen_b5_candidate)
+            profile_overrides = deep_merge(profile_overrides, profile_entry)
             description = f"{description} (base={frozen_b5_candidate})".strip()
+        else:
+            profile_entry.pop("description", None)
+            profile_overrides = profile_entry
 
         profile_cfg = _resolve_cfg(effective_profile_name, profile_overrides)
 

@@ -6,12 +6,16 @@ data/*
 !data/README.md
 tests/*
 eval/*
+backups/*
 
 # Config files
 config.yaml
 notes/*
 docs/*
 prompts/*
+RESTORE_RAG_STATE_*.md
+RESTORE_RAG_STATE_*.sh
+config/ablation_profiles.*probe.yaml
 
 # Python cache
 __pycache__/

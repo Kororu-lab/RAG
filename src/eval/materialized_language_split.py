@@ -574,6 +574,41 @@ def resolve_target_label_to_lang_id(
     return None
 
 
+def _resolved_pair_is_distinct(resolved_ids: Sequence[str | None]) -> bool:
+    uniq = [str(v) for v in resolved_ids if v]
+    return len(set(uniq)) == 2
+
+
+def _resolve_explicit_pair_lang_ids(
+    *,
+    explicit_targets: Sequence[str],
+    explicit_surfaces: Sequence[str],
+    metadata_store: MetadataStore | None,
+    recovery_mode: str,
+    fallback_targets: Sequence[str] | None = None,
+    fallback_spans: Sequence[str] | None = None,
+) -> List[str | None]:
+    resolved_ids: List[str | None] = []
+    fallback_targets = list(fallback_targets or [])
+    fallback_spans = list(fallback_spans or [])
+    for idx, (label, surface) in enumerate(zip(explicit_targets, explicit_surfaces, strict=False)):
+        resolved = resolve_target_label_to_lang_id(
+            label=label,
+            anchor_span=surface,
+            metadata_store=metadata_store,
+            recovery_mode=recovery_mode,
+        )
+        if not resolved and idx < len(fallback_targets):
+            resolved = resolve_target_label_to_lang_id(
+                label=fallback_targets[idx],
+                anchor_span=fallback_spans[idx] if idx < len(fallback_spans) else "",
+                metadata_store=metadata_store,
+                recovery_mode=recovery_mode,
+            )
+        resolved_ids.append(resolved)
+    return resolved_ids
+
+
 def _shared_ask_clean(shared_ask: str, targets: Sequence[str]) -> str:
     ask = normalize_text(shared_ask)
     previous = None
@@ -667,8 +702,9 @@ def _render_branch_query_surface_preserving(
         or not anchor_retained
         or not re.search(r"(알려\s*주세요|설명해\s*주세요|말해\s*주세요|나열해\s*주세요|보여\s*주세요|인가요\?|어디인가요\?)\.?$", branch_query)
     ):
-        fallback = _render_branch_query(lang_label=lang_label, shared_ask=fallback_shared_ask)
-        return fallback, topical_anchor, bool(topical_anchor and topical_anchor in fallback)
+        fallback_anchor = normalize_text(topical_anchor) or normalize_text(fallback_shared_ask)
+        fallback = _render_branch_query(lang_label=lang_label, shared_ask=fallback_anchor)
+        return fallback, fallback_anchor, bool(fallback_anchor and fallback_anchor in fallback)
     return branch_query, topical_anchor, anchor_retained
 
 
@@ -868,28 +904,6 @@ def materialize_language_split_plan(
                 "prompt_bundle": PROMPT_BUNDLE,
             })
 
-        if any(_is_dialect_like(value) for value in [*target_labels, *target_spans]):
-            policy_flags["dialect_like"] = True
-        if any(policy_flags.get(flag, False) for flag in ["dialect_like", "topic_like", "contextual_only", "uncertain"]):
-            reasons = [name for name, active in policy_flags.items() if active and name in {"dialect_like", "topic_like", "contextual_only", "uncertain"}]
-            return _finish({
-                "should_split": False,
-                "split_count": 0,
-                "axis": "none",
-                "extracted_targets": target_labels,
-                "extracted_target_spans": target_spans,
-                "shared_ask": "",
-                "branch_queries": [],
-                "abstain_reason": ";".join(reasons) if reasons else "policy_gate_rejected",
-                "cleanliness_flags": {},
-                "policy_flags": policy_flags,
-                "notes": str(parsed.get("notes") or ""),
-                "extractor_output": parsed,
-                "extractor_raw": extractor.raw,
-                "extractor_repaired": extractor.repaired,
-                "prompt_bundle": PROMPT_BUNDLE,
-            })
-
         if not explicit_pairs:
             return _finish({
                 "should_split": False,
@@ -933,6 +947,30 @@ def materialize_language_split_plan(
                 strict=False,
             )
         ]
+        if any(_is_dialect_like(value) for value in [*target_labels, *target_spans]):
+            policy_flags["dialect_like"] = True
+        if policy_flags.get("dialect_like") and _resolved_pair_is_distinct(resolved_explicit_ids):
+            policy_flags["dialect_like"] = False
+            policy_flags["dialect_like_overridden_by_metadata"] = True
+        if any(policy_flags.get(flag, False) for flag in ["dialect_like", "topic_like", "contextual_only", "uncertain"]):
+            reasons = [name for name, active in policy_flags.items() if active and name in {"dialect_like", "topic_like", "contextual_only", "uncertain"}]
+            return _finish({
+                "should_split": False,
+                "split_count": 0,
+                "axis": "none",
+                "extracted_targets": target_labels,
+                "extracted_target_spans": target_spans,
+                "shared_ask": "",
+                "branch_queries": [],
+                "abstain_reason": ";".join(reasons) if reasons else "policy_gate_rejected",
+                "cleanliness_flags": {},
+                "policy_flags": policy_flags,
+                "notes": str(parsed.get("notes") or ""),
+                "extractor_output": parsed,
+                "extractor_raw": extractor.raw,
+                "extractor_repaired": extractor.repaired,
+                "prompt_bundle": PROMPT_BUNDLE,
+            })
         if any(not lang_id for lang_id in resolved_explicit_ids):
             return _finish({
                 "should_split": False,
@@ -1093,8 +1131,19 @@ def materialize_language_split_plan(
             "prompt_bundle": PROMPT_BUNDLE,
         })
 
+    resolved_explicit_ids = _resolve_explicit_pair_lang_ids(
+        explicit_targets=explicit_targets,
+        explicit_surfaces=explicit_surfaces,
+        metadata_store=metadata_store,
+        recovery_mode="recovered",
+        fallback_targets=target_labels,
+        fallback_spans=target_spans,
+    )
     if any(_is_dialect_like(value) for value in [*explicit_targets, *explicit_surfaces, *target_labels, *target_spans]):
         policy_flags["dialect_like"] = True
+    if policy_flags.get("dialect_like") and _resolved_pair_is_distinct(resolved_explicit_ids):
+        policy_flags["dialect_like"] = False
+        policy_flags["dialect_like_overridden_by_metadata"] = True
     if any(policy_flags.get(flag, False) for flag in ["dialect_like", "topic_like", "contextual_only"]):
         reasons = [name for name, active in policy_flags.items() if active and name in {"dialect_like", "topic_like", "contextual_only"}]
         return _finish({
@@ -1114,23 +1163,6 @@ def materialize_language_split_plan(
             "extractor_repaired": extractor.repaired,
             "prompt_bundle": PROMPT_BUNDLE,
         })
-
-    resolved_explicit_ids: List[str | None] = []
-    for idx, (label, surface) in enumerate(zip(explicit_targets, explicit_surfaces, strict=False)):
-        resolved = resolve_target_label_to_lang_id(
-            label=label,
-            anchor_span=surface,
-            metadata_store=metadata_store,
-            recovery_mode="recovered",
-        )
-        if not resolved and idx < len(target_labels):
-            resolved = resolve_target_label_to_lang_id(
-                label=target_labels[idx],
-                anchor_span=target_spans[idx] if idx < len(target_spans) else "",
-                metadata_store=metadata_store,
-                recovery_mode="recovered",
-            )
-        resolved_explicit_ids.append(resolved)
 
     if not any(resolved_explicit_ids):
         return _finish({

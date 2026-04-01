@@ -1,7 +1,74 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RUN_ID="final_clean_b0_b7_final"
+usage() {
+  cat <<'EOF'
+Usage: bash scripts/run_final_b0_b7.sh [--canonical] [--filtering viking|metadata]
+
+Default:
+  Create a new timestamped run under eval/runs/ without overwriting prior runs.
+
+Options:
+  --canonical   Reuse the fixed canonical run id (final_clean_b0_b7_final) and overwrite it.
+  --filtering   Filtering mode for B4/B6/B7. Default: viking. Use metadata to restore
+                the previous metadata-only behavior.
+  --help, -h    Show this help text.
+
+Environment:
+  RUN_ID                Optional explicit run id. If the directory already exists, the script aborts
+                        unless --canonical is also set.
+  EMBED_MODEL_PATH      Optional local embedding snapshot path override.
+  RERANK_MODEL_PATH     Optional local reranker snapshot path override.
+  HARNESS_FILTERING_MODE
+                       Optional filtering mode override for B4/B6/B7. Same choices as
+                       --filtering. Default: viking.
+EOF
+}
+
+CANONICAL_MODE=0
+FILTERING_MODE="${HARNESS_FILTERING_MODE:-viking}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --canonical)
+      CANONICAL_MODE=1
+      shift
+      ;;
+    --filtering)
+      if [[ $# -lt 2 ]]; then
+        echo "--filtering requires an argument: viking or metadata" >&2
+        exit 1
+      fi
+      FILTERING_MODE="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+case "$FILTERING_MODE" in
+  viking|metadata)
+    ;;
+  *)
+    echo "Unknown filtering mode: $FILTERING_MODE" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
+
+if [[ "$CANONICAL_MODE" -eq 1 ]]; then
+  RUN_ID="final_clean_b0_b7_final"
+else
+  RUN_ID="${RUN_ID:-final_clean_b0_b7_$(date +%Y%m%d_%H%M%S)}"
+fi
+
 RUN_DIR="eval/runs/${RUN_ID}"
 EMBED_MODEL_PATH="${EMBED_MODEL_PATH:-$HOME/.cache/huggingface/hub/models--BAAI--bge-m3/snapshots/5617a9f61b028005a4858fdac845db406aefb181}"
 RERANK_MODEL_PATH="${RERANK_MODEL_PATH:-$HOME/.cache/huggingface/hub/models--BAAI--bge-reranker-v2-m3/snapshots/953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e}"
@@ -16,7 +83,15 @@ if [[ ! -d "$RERANK_MODEL_PATH" ]]; then
 fi
 
 mkdir -p eval/finalize eval/runs
-rm -rf "$RUN_DIR"
+if [[ "$CANONICAL_MODE" -eq 1 ]]; then
+  rm -rf "$RUN_DIR"
+elif [[ -e "$RUN_DIR" ]]; then
+  echo "Refusing to overwrite existing run directory: $RUN_DIR" >&2
+  echo "Use --canonical only if you intentionally want to replace the canonical final run." >&2
+  exit 1
+fi
+
+echo "[run_final_b0_b7] RUN_ID=$RUN_ID"
 rm -f \
   eval/finalize/main_table_metrics.csv \
   eval/finalize/groupwise_metrics.csv \
@@ -45,6 +120,7 @@ UV_CACHE_DIR=/tmp/uv-cache uv run python -m py_compile \
   src/ui/runtime_config.py
 
 RUN_ID="${RUN_ID}" \
+HARNESS_FILTERING_MODE="${FILTERING_MODE}" \
 EMBED_MODEL_PATH="${EMBED_MODEL_PATH}" \
 RERANK_MODEL_PATH="${RERANK_MODEL_PATH}" \
 HF_HUB_OFFLINE=1 \
@@ -56,12 +132,20 @@ from pathlib import Path
 import os
 import traceback
 
-from src.eval.profiles import deep_merge, load_profile_file, resolve_profile_config, select_profiles
+from src.eval.profiles import (
+    deep_merge,
+    load_profile_file,
+    profile_base_chain,
+    resolve_profile_config,
+    resolve_profile_overrides,
+    select_profiles,
+)
 from src.eval.run_ablation import _load_qaset, _utc_now, _write_csv, _write_json, run_profile
 from src.utils import load_config
 
 run_id = os.environ["RUN_ID"]
-query_file = "test_revised.jsonl"
+filtering_mode = os.environ.get("HARNESS_FILTERING_MODE", "viking").strip() or "viking"
+query_file = "data/test_revised.jsonl"
 profile_config = "config/ablation_profiles.yaml"
 selected_profile_arg = "B0,B1,B2,B3,B4,B6,B7"
 out_dir = Path("eval/runs") / run_id
@@ -84,6 +168,7 @@ run_meta = {
     "query_file": query_file,
     "query_count": len(queries),
     "profile_config": profile_config,
+    "filtering_mode": filtering_mode,
     "profiles_planned": selected_profiles,
     "profiles_results": [],
     "embedding_model_path": os.environ["EMBED_MODEL_PATH"],
@@ -94,15 +179,17 @@ _write_json(run_meta_path, run_meta)
 retrieval_macro_rows = []
 
 for profile_name in selected_profiles:
-    profile_overrides = deepcopy(profiles_map.get(profile_name) or {})
-    description = str(profile_overrides.pop("description", ""))
+    profile_entry = deepcopy(profiles_map.get(profile_name) or {})
+    description = str(profile_entry.get("description", ""))
     ablation_block = (profiles_map.get(profile_name, {}) or {}).get("ablation", {}) or {}
     base_profile_name = str(ablation_block.get("base_profile") or "").strip()
     if base_profile_name and base_profile_name in profiles_map:
-        base_profile_overrides = deepcopy(profiles_map.get(base_profile_name) or {})
-        base_profile_overrides.pop("description", None)
-        profile_overrides = deep_merge(base_profile_overrides, profile_overrides)
-        description = f"{description} (base={base_profile_name})".strip()
+        base_chain = profile_base_chain(profiles_map, profile_name)
+        profile_overrides = resolve_profile_overrides(profiles_map, profile_name)
+        description = f"{description} (base={'->'.join(base_chain)})".strip()
+    else:
+        profile_entry.pop("description", None)
+        profile_overrides = profile_entry
 
     profile_cfg = resolve_profile_config(
         base_config=base_config,
@@ -111,6 +198,7 @@ for profile_name in selected_profiles:
         profile_overrides=profile_overrides,
         fixed_k=None,
         fixed_top_n=None,
+        filtering_mode=filtering_mode,
     )
 
     status_row = {
@@ -171,7 +259,7 @@ PY
 
 UV_CACHE_DIR=/tmp/uv-cache uv run python src/eval/build_finalize_summary.py \
   --run-dir "${RUN_DIR}" \
-  --query-file test_revised.jsonl \
+  --query-file data/test_revised.jsonl \
   --out-dir eval/finalize \
   --repo-root . \
   --metadata-path metadata.enriched.csv

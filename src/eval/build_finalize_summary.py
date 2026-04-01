@@ -8,11 +8,6 @@ from statistics import mean
 from typing import Dict, Iterable, List
 
 
-GROUP_LABELS = {
-    "single_lang_single_topic": "T1",
-    "multi_lang_single_topic": "T2",
-    "single_lang_multi_topic": "T3",
-}
 METRIC_KEYS = (
     ("doc@10", "doc_recall_at_10"),
     ("chunk@10", "chunk_recall_at_10"),
@@ -49,8 +44,17 @@ def _safe_float(value: str) -> float:
         return 0.0
 
 
-def _iter_group_rows(rows: Iterable[Dict[str, str]], query_type: str) -> List[Dict[str, str]]:
-    return [row for row in rows if row.get("query_type") == query_type]
+def _row_group_label(row: Dict[str, str]) -> str:
+    label = str(row.get("group_label", "") or "").strip().upper()
+    if label:
+        return label
+    query_type = str(row.get("query_type", "") or "").strip()
+    fallback = {
+        "single_lang_single_topic": "T1",
+        "multi_lang_single_topic": "T2",
+        "single_lang_multi_topic": "T3",
+    }
+    return fallback.get(query_type, "UNKNOWN")
 
 
 def _write_csv(path: Path, fieldnames: List[str], rows: List[Dict[str, object]]) -> None:
@@ -89,14 +93,16 @@ def build_outputs(*, run_dir: Path, query_file: str, out_dir: Path, repo_root: P
         )
 
         summary_rows = _read_csv_rows(profile_dir / "summary.csv")
-        for query_type, group_label in GROUP_LABELS.items():
-            group_slice = _iter_group_rows(summary_rows, query_type)
+        group_labels = sorted({_row_group_label(row) for row in summary_rows if _row_group_label(row) != "UNKNOWN"})
+        for group_label in group_labels:
+            group_slice = [row for row in summary_rows if _row_group_label(row) == group_label]
             if not group_slice:
                 continue
+            query_types = sorted({str(row.get("query_type", "") or "").strip() for row in group_slice if str(row.get("query_type", "") or "").strip()})
             row: Dict[str, object] = {
                 "profile": profile,
                 "group_label": group_label,
-                "query_type": query_type,
+                "query_type": ",".join(query_types),
                 "query_count": len(group_slice),
             }
             for output_key, source_key in METRIC_KEYS:
@@ -117,11 +123,11 @@ def build_outputs(*, run_dir: Path, query_file: str, out_dir: Path, repo_root: P
     profile_name_map = {
         "B0": "raw_dense_baseline",
         "B1": "summary_dense_baseline",
-        "B2": "summary_dense_plus_bm25_rrf",
+        "B2": "summary_dense_plus_bm25_lexical_augmentation_rerank",
         "B3": "summary_dense_plus_recursive_retrieval",
         "B4": "query_only_metadata_filtering",
-        "B6": "b4_plus_reranker",
-        "B7": "finalized_materialized_language_split",
+        "B6": "b6_plus_bm25_lexical_augmentation_rerank",
+        "B7": "b7_plus_bm25_lexical_augmentation_rerank",
     }
     with (out_dir / "profile_name_map.json").open("w", encoding="utf-8") as f:
         json.dump(profile_name_map, f, ensure_ascii=False, indent=2)

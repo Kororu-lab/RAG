@@ -12,6 +12,76 @@ from src.llm.factory import get_llm
 from src.utils import LLMUtility, load_config
 
 
+def _query_prefers_explanatory_style(query: str) -> bool:
+    q = str(query or "").strip().lower()
+    if not q:
+        return False
+    markers = [
+        "비교", "설명", "특징", "차이", "공통", "대조", "방법", "양상", "의미", "용법",
+        "compare", "comparison", "explain", "difference", "contrast", "feature",
+    ]
+    return any(marker in q for marker in markers)
+
+
+def _query_prefers_comparison_table(query: str) -> bool:
+    q = str(query or "").strip().lower()
+    if not q:
+        return False
+    markers = [
+        "비교", "대조", "차이", "공통점", "차이점",
+        "compare", "comparison", "contrast", "difference",
+    ]
+    return any(marker in q for marker in markers)
+
+
+def _query_requests_examples(query: str) -> bool:
+    q = str(query or "").strip().lower()
+    if not q:
+        return False
+    markers = [
+        "예문", "예시", "보기", "실례",
+        "example", "examples",
+    ]
+    return any(marker in q for marker in markers)
+
+
+def _build_style_rule(query: str, settings: dict) -> str:
+    answer_format_style = settings["answer_format_style"]
+    explanatory_enabled = settings.get("explanatory_concise_style_enabled", True)
+    example_rule = ""
+    if _query_requests_examples(query):
+        example_rule = (
+            " 예문 요청이면 [Example Spans]에 있는 원문 예문을 답변의 중심으로 사용하십시오. "
+            "가능하면 예문 2-3개를 먼저 제시하고, 각 예문 뒤에 그 예문이 무엇을 보여주는지 1문장으로만 설명하십시오. "
+            "예문이 있는데도 추상 요약만 길게 늘어놓지 마십시오."
+        )
+    if answer_format_style == "fluent_with_table":
+        return (
+            "9. **Format**: 짧은 도입(1-2문장) + 필요 시 비교표 1개 + 짧은 결론(1-2문장). "
+            "표의 모든 데이터 행 끝에 근거 태그를 붙이고, 표 밖의 문장도 문장마다 근거 태그를 붙이십시오."
+            f"{example_rule}"
+        )
+    if explanatory_enabled and _query_prefers_explanatory_style(query):
+        comparison_table_enabled = settings.get("comparison_table_preference_enabled", True)
+        comparison_table_rule = ""
+        if comparison_table_enabled and _query_prefers_comparison_table(query):
+            comparison_table_rule = (
+                " 비교 질의라면 가능하면 기능/형태/예시처럼 직접 대응되는 항목을 묶어 "
+                "작은 비교표 1개를 우선 사용하십시오. 다만 표가 오히려 흐름을 끊거나 대응 항목이 불분명하면 "
+                "표 없이 설명형으로 답하십시오. "
+                "표를 쓸 때는 표 뒤에서 핵심 차이와 공통점을 1-2문장으로 풀어 설명하십시오."
+            )
+        return (
+            "9. **Format**: 설명형으로 작성하십시오. 먼저 1-2문장으로 핵심 요지를 요약한 뒤, "
+            "서로 관련된 근거를 묶어 2-4개의 짧은 문단 또는 번호 목록으로 설명하십시오. "
+            "한 주장씩 기계적으로 나열하는 flat claim dump를 피하십시오. "
+            "비교 질의라면 각 언어를 따로 사실 나열하지 말고 공통점과 차이점을 문장 안에서 직접 대조하십시오. "
+            "필요할 때만 작은 비교표 1개를 사용할 수 있지만, 표만 던지지 말고 앞뒤에 설명 문장을 붙이십시오."
+            f"{comparison_table_rule}{example_rule}"
+        )
+    return f"9. **Format**: 핵심 불릿 위주로 간결하게 작성하십시오.{example_rule}"
+
+
 
 def _get_grounding_settings() -> dict:
     config = load_config()
@@ -25,6 +95,12 @@ def _get_grounding_settings() -> dict:
         "max_claims_per_answer": int(rag_cfg.get("max_claims_per_answer", 12)),
         "missing_info_phrase": str(rag_cfg.get("missing_info_phrase", "정보가 부족합니다")).strip() or "정보가 부족합니다",
         "answer_format_style": answer_format_style,
+        "explanatory_concise_style_enabled": bool(
+            rag_cfg.get("explanatory_concise_style_enabled", True)
+        ),
+        "comparison_table_preference_enabled": bool(
+            rag_cfg.get("comparison_table_preference_enabled", True)
+        ),
     }
 
 
@@ -38,7 +114,6 @@ def get_rag_chain(request_timeout_sec: int | None = None):
     require_inline_citations = settings["require_inline_citations"]
     max_claims_per_answer = max(1, settings["max_claims_per_answer"])
     missing_info_phrase = settings["missing_info_phrase"]
-    answer_format_style = settings["answer_format_style"]
 
     if grounding_mode == "strict_extractive":
         system_text = """당신은 LTDB 문맥 기반 추출 응답기입니다.
@@ -75,12 +150,7 @@ def get_rag_chain(request_timeout_sec: int | None = None):
         if require_inline_citations
         else "6. **Inline Evidence Tags**: 가능하면 [lang/file.html:chunk_id] 태그를 붙이십시오."
     )
-    style_rule = (
-        "9. **Format**: 짧은 도입(1-2문장) + 필요 시 비교표 1개 + 짧은 결론(1-2문장). "
-        "표의 모든 데이터 행 끝에 근거 태그를 붙이고, 표 밖의 문장도 문장마다 근거 태그를 붙이십시오."
-        if answer_format_style == "fluent_with_table"
-        else "9. **Format**: 핵심 불릿 위주로 간결하게 작성하십시오."
-    )
+    style_rule = _build_style_rule("{question}", settings)
 
     human_text = """[Context]
 {context}
@@ -130,11 +200,7 @@ def generate_answer(
             ),
             "max_claims_per_answer": max(1, settings["max_claims_per_answer"]),
             "missing_info_phrase": settings["missing_info_phrase"],
-            "style_rule": (
-                "9. **Format**: 짧은 도입(1-2문장) + 필요 시 비교표 1개 + 짧은 결론(1-2문장). 표의 모든 데이터 행 끝에 근거 태그를 붙이고, 표 밖의 문장도 문장마다 근거 태그를 붙이십시오."
-                if settings["answer_format_style"] == "fluent_with_table"
-                else "9. **Format**: 핵심 불릿 위주로 간결하게 작성하십시오."
-            ),
+            "style_rule": _build_style_rule(query, settings),
         }
     )
     return response

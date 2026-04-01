@@ -5,6 +5,25 @@ from statistics import mean
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 
+def _row_group_label(row: Dict[str, Any]) -> str:
+    label = str(row.get("group_label", "") or "").strip().upper()
+    if label:
+        return label
+
+    query_id = str(row.get("query_id", "") or "").strip().upper()
+    prefix = query_id.split("_", 1)[0] if query_id else ""
+    if prefix in {"T1", "T2", "T3", "T4", "T5", "T6"}:
+        return prefix
+
+    query_type = str(row.get("query_type", "") or "").strip()
+    fallback = {
+        "single_lang_single_topic": "T1",
+        "multi_lang_single_topic": "T2",
+        "single_lang_multi_topic": "T3",
+    }
+    return fallback.get(query_type, "UNKNOWN")
+
+
 def _safe_chunk_id(value: Any) -> str:
     if value is None:
         return ""
@@ -109,8 +128,8 @@ def aggregate_macro_micro(
 
             per_type_values = defaultdict(list)
             for row in rows:
-                q_type = str(row.get("query_type", "unknown"))
-                per_type_values[q_type].append(float(row.get(key, 0.0)))
+                group_label = _row_group_label(row)
+                per_type_values[group_label].append(float(row.get(key, 0.0)))
 
             macro_components = [_mean(vals) for vals in per_type_values.values() if vals]
             macro = _mean(macro_components)
